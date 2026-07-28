@@ -248,8 +248,9 @@ std::optional<std::vector<Segment>> segments(const LinkGraph &Graph,
        static_cast<uint32_t>(llvm::MachO::VM_PROT_READ) |
            static_cast<uint32_t>(llvm::MachO::VM_PROT_EXECUTE),
        std::move(Text)},
-      {"__DATA_CONST", ConstantStart,
-       Constant.empty() ? 0 : ConstantEnd - ConstantStart, ConstantStart,
+      {"__DATA_CONST", Constant.empty() ? DataStart : ConstantStart,
+       Constant.empty() ? 0 : ConstantEnd - ConstantStart,
+       Constant.empty() ? DataStart : ConstantStart,
        Constant.empty() ? 0 : ConstantFileEnd - ConstantStart,
        static_cast<uint32_t>(llvm::MachO::VM_PROT_READ) |
            static_cast<uint32_t>(llvm::MachO::VM_PROT_WRITE),

@@ -2250,6 +2250,40 @@ TEST(MachOWriterTest, WritesDeterministicDylibsForMacOSTargets) {
   }
 }
 
+TEST(MachOWriterTest, OrdersEmptyDataConstBeforeData) {
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("writer.o"));
+  ASSERT_TRUE(Graph.addSection(Section{
+      "__text", SectionKind::Text, 4, 4, 0, 0, {0xC0, 0x03, 0x5F, 0xD6}}));
+  ASSERT_TRUE(Graph.addSection(Section{"__eh_frame",
+                                       SectionKind::Unwind,
+                                       8,
+                                       4,
+                                       0,
+                                       0,
+                                       {0, 0, 0, 0},
+                                       SectionPurpose::EHFrame}));
+  ASSERT_TRUE(Graph.addSection(Section{"__data", SectionKind::Data, 8, 8, 0, 0,
+                                       std::vector<WasmEdge::Byte>(8)}));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(MachOWriter::write(Graph, Output));
+
+  size_t Command = 32;
+  uint64_t PreviousFileOffset = 0;
+  for (uint32_t I = 0; I < 4; ++I) {
+    ASSERT_EQ(readInteger(Bytes, Command, 4, Endianness::Little),
+              llvm::MachO::LC_SEGMENT_64);
+    const uint64_t FileOffset =
+        readInteger(Bytes, Command + 40, 8, Endianness::Little);
+    EXPECT_GE(FileOffset, PreviousFileOffset);
+    PreviousFileOffset = FileOffset;
+    Command += readInteger(Bytes, Command + 4, 4, Endianness::Little);
+  }
+}
+
 TEST(MachOWriterTest, RejectsRawCompactUnwind) {
   LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
   ASSERT_TRUE(Graph.beginInput("compact.o"));

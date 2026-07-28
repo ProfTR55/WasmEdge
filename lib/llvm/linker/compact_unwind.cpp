@@ -303,7 +303,7 @@ bool appendX8664CFI(uint32_t Encoding, std::vector<Byte> &Bytes) {
   Bytes.push_back(DWCfaOffset | 6);
   appendULEB(Bytes, 2);
   for (const auto &[Register, Slot] : Saved) {
-    Bytes.push_back(DWCfaOffset | Register);
+    Bytes.push_back(static_cast<Byte>(DWCfaOffset | Register));
     appendULEB(Bytes, static_cast<uint64_t>(StackOffset) + 2 - Slot);
   }
   return true;
@@ -815,8 +815,8 @@ Expect<void> compactUnwindToEHFrame(LinkGraph &Graph) {
       return fail();
     ExistingSection = I;
     Synthetic = Graph.sections()[I];
-    Content.assign(Synthetic.Content.begin(),
-                   Synthetic.Content.begin() + *Terminator);
+    Content.assign(Synthetic.Content.data(),
+                   Synthetic.Content.data() + *Terminator);
     break;
   }
   const size_t CIE = Content.size();

@@ -1073,7 +1073,7 @@ LinkExpect<void> LinkGraph::writeSectionContent(SectionId Id, uint64_t Offset,
     return fail<void>(std::move(Diag));
   }
   auto NewContent = Sections[Id].Content;
-  std::copy(Content.begin(), Content.end(), NewContent.begin() + Offset);
+  std::copy(Content.begin(), Content.end(), NewContent.data() + Offset);
   Sections[Id].Content.swap(NewContent);
   return {};
 }
