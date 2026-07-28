@@ -239,20 +239,26 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
       return fail(RelocationValue, "relocation addend overflows");
     }
     Addend += FormatAdjustment;
-    if (Absolute || ImageRelative) {
-      uint64_t Value = 0;
-      if (!addUnsigned(S, Addend, Value) ||
-          (ImageRelative && Value < PEImageBase)) {
+    if (ImageRelative) {
+      if (S < PEImageBase || S - PEImageBase > UINT32_MAX) {
         return fail(RelocationValue, "absolute relocation overflows");
       }
-      if (ImageRelative)
-        Value -= PEImageBase;
+      const uint32_t Value = static_cast<uint32_t>(S - PEImageBase) +
+                             static_cast<uint32_t>(Addend);
       if (!writeUnsigned(Bytes, RelocationValue.Offset, Width,
                          Graph.endianness(), Value)) {
         return fail(RelocationValue, "absolute relocation overflows");
       }
-      if (ImageRelative) {
-        continue;
+      continue;
+    }
+    if (Absolute) {
+      uint64_t Value = 0;
+      if (!addUnsigned(S, Addend, Value)) {
+        return fail(RelocationValue, "absolute relocation overflows");
+      }
+      if (!writeUnsigned(Bytes, RelocationValue.Offset, Width,
+                         Graph.endianness(), Value)) {
+        return fail(RelocationValue, "absolute relocation overflows");
       }
       const auto Overlap = std::find_if(
           Result.Rebases.begin(), Result.Rebases.end(), [&](const auto &Old) {

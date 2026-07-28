@@ -4755,6 +4755,22 @@ TEST(RelocationTest, DecodesCOFFAddr32NBImplicitAddendAsUnsigned) {
   EXPECT_EQ(*Value, static_cast<uint64_t>(Addend) + 0x2000);
 }
 
+TEST(RelocationTest, WrapsCOFFAddr32NBAt32Bits) {
+  constexpr uint64_t ImageBase = UINT64_C(0x180000000);
+  constexpr uint32_t Addend = UINT32_C(0xFFFFF000);
+  auto Graph = makeRelocationGraph(llvm::COFF::IMAGE_REL_AMD64_ADDR32NB, 0,
+                                   true, ImageBase + 0x2000, ImageBase + 0x1000,
+                                   ObjectFormat::COFF);
+  std::array<WasmEdge::Byte, 4> Bytes{};
+  std::memcpy(Bytes.data(), &Addend, sizeof(Addend));
+  ASSERT_TRUE(Graph.writeSectionContent(0, 1, Bytes));
+  ASSERT_TRUE(applyRelocations(Graph));
+  auto Value = Internal::readUnsigned(Graph.sections()[0].Content, 1, 4,
+                                      Endianness::Little);
+  ASSERT_TRUE(Value);
+  EXPECT_EQ(*Value, 0x1000U);
+}
+
 TEST(RelocationTest, AcceptsMachOAbsoluteAndRejectsGOTForms) {
   EXPECT_EQ(relocationPatchSize(ObjectFormat::MachO, Target::X86_64,
                                 llvm::MachO::X86_64_RELOC_UNSIGNED, 8),
