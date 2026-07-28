@@ -682,10 +682,10 @@ parseCOFFExports(std::string_view Input) {
   return Exports;
 }
 
-LinkExpect<uint64_t>
-resolveCompactUnwindTargetOffset(bool External, uint64_t SectionAddress,
-                                  uint64_t SymbolOffset,
-                                  uint64_t RawAddend) {
+LinkExpect<uint64_t> resolveCompactUnwindTargetOffset(bool External,
+                                                      uint64_t SectionAddress,
+                                                      uint64_t SymbolOffset,
+                                                      uint64_t RawAddend) {
   if (!External) {
     if (RawAddend < SectionAddress)
       return Unexpected<Diagnostic>(
@@ -810,8 +810,8 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       MachO && MachO->getHeader().cputype == MachOCPUTypeArm64 &&
       (MachO->getHeader().cpusubtype & ~MachOCPUSubtypeMask) !=
           MachOCPUSubtypeArm64All) {
-    return fail<LinkGraph>(
-        "unsupported non-generic AArch64 Mach-O CPU subtype (including arm64e)");
+    return fail<LinkGraph>("unsupported non-generic AArch64 Mach-O CPU subtype "
+                           "(including arm64e)");
   }
 
   LinkGraph Graph(*ActualTarget,
@@ -1265,7 +1265,8 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
         return fail<LinkGraph>("malformed relocation metadata");
       }
       if (Object.isMachO() && *ActualTarget == Target::AArch64 &&
-          Graph.sections()[Section->second].Purpose == SectionPurpose::EHFrame) {
+          Graph.sections()[Section->second].Purpose ==
+              SectionPurpose::EHFrame) {
         const auto Type = InputRelocation->getType();
         if (Type == llvm::MachO::ARM64_RELOC_UNSIGNED)
           return fail<LinkGraph>(
@@ -1324,7 +1325,8 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
           const auto &SubtractorSymbol = Graph.symbols()[Subtractor->second];
           const auto &UnsignedSymbol = Graph.symbols()[Unsigned->second];
           if (UnsignedSymbol.Section >= Graph.sections().size() ||
-              Graph.sections()[UnsignedSymbol.Section].Kind != SectionKind::Text)
+              Graph.sections()[UnsignedSymbol.Section].Kind !=
+                  SectionKind::Text)
             return fail<LinkGraph>(
                 "AArch64 Mach-O EH frame relocation target is not a function "
                 "symbol");
@@ -1337,8 +1339,8 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
               Raw != UINT64_C(0) - (Offset - SubtractorSymbol.Offset))
             return fail<LinkGraph>(
                 "unsupported AArch64 Mach-O EH frame relocation addend");
-          if (!Graph.addEHFrameReference(EHFrameReference{
-                  Section->second, Offset, Unsigned->second}))
+          if (!Graph.addEHFrameReference(
+                  EHFrameReference{Section->second, Offset, Unsigned->second}))
             return fail<LinkGraph>("invalid Mach-O EH frame relocation");
           ++InputRelocation;
           continue;
@@ -1352,7 +1354,8 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       if (Symbol == SymbolIds.end()) {
         return fail<LinkGraph>("relocation targets an unsupported symbol");
       }
-      const auto [Addend, Implicit] = relocationAddend(Object, *InputRelocation);
+      const auto [Addend, Implicit] =
+          relocationAddend(Object, *InputRelocation);
       if (InputRelocation->getType() > UINT32_MAX) {
         return fail<LinkGraph>("relocation type is out of range");
       }

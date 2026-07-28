@@ -56,10 +56,10 @@ struct DecodedCompactUnwindRecord {
 LinkExpect<std::vector<DecodedCompactUnwindRecord>>
 parseCompactUnwindSection(Target TargetValue, Span<const Byte> Content,
                           Span<const CompactUnwindRelocation> Relocations);
-LinkExpect<uint64_t>
-resolveCompactUnwindTargetOffset(bool External, uint64_t SectionAddress,
-                                  uint64_t SymbolOffset,
-                                  uint64_t RawAddend);
+LinkExpect<uint64_t> resolveCompactUnwindTargetOffset(bool External,
+                                                      uint64_t SectionAddress,
+                                                      uint64_t SymbolOffset,
+                                                      uint64_t RawAddend);
 
 } // namespace Internal
 

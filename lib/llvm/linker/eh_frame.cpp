@@ -258,7 +258,7 @@ Expect<uint64_t> resolveMachOFDEAddress(uint64_t LoadBase,
 } // namespace Internal
 
 Expect<std::set<size_t>> machOEHFrameFields(Span<const Byte> Bytes,
-                                           Target Architecture) {
+                                            Target Architecture) {
   EXPECTED_TRY(auto Parsed, parse(Bytes, Architecture));
   return Parsed.FDEFields;
 }
@@ -285,8 +285,8 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
         Sections[Reference.Section].Purpose != SectionPurpose::EHFrame ||
         Reference.Symbol >= Graph.symbols().size() ||
         Graph.symbols()[Reference.Symbol].Section >= Sections.size() ||
-        Fields[Reference.Section].count(static_cast<size_t>(Reference.Offset)) ==
-            0 ||
+        Fields[Reference.Section].count(
+            static_cast<size_t>(Reference.Offset)) == 0 ||
         !ReferenceFields.emplace(Reference.Section, Reference.Offset).second)
       return fail();
   }
