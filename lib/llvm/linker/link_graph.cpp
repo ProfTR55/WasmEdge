@@ -69,6 +69,137 @@ LinkExpect<void> relocated() {
   return fail<void>(Diagnostic{"link graph relocations already applied"});
 }
 
+LinkExpect<uint64_t> compactUnwindAddress(const CompactUnwindRecord &Value,
+                                          const std::vector<Section> &Sections,
+                                          const std::vector<Symbol> &Symbols) {
+  if (Value.Function >= Symbols.size()) {
+    Diagnostic Diag{"invalid compact unwind function symbol ID"};
+    Diag.Symbol = Value.Function;
+    return fail<uint64_t>(std::move(Diag));
+  }
+  const auto &Function = Symbols[Value.Function];
+  if (Function.Section >= Sections.size()) {
+    Diagnostic Diag{"invalid compact unwind function section ID"};
+    Diag.Symbol = Value.Function;
+    Diag.Section = Function.Section;
+    return fail<uint64_t>(std::move(Diag));
+  }
+  const auto &Section = Sections[Function.Section];
+  if (Section.Kind != SectionKind::Text) {
+    Diagnostic Diag{"compact unwind function must reference text section"};
+    Diag.Symbol = Value.Function;
+    Diag.Section = Function.Section;
+    return fail<uint64_t>(std::move(Diag));
+  }
+  if (Value.Length == 0) {
+    Diagnostic Diag{"compact unwind function length must be non-zero"};
+    Diag.Symbol = Value.Function;
+    return fail<uint64_t>(std::move(Diag));
+  }
+  if (extendsBeyond(Function.Offset, Value.Length, Section.VirtualSize)) {
+    Diagnostic Diag{"compact unwind function range exceeds text section"};
+    Diag.Symbol = Value.Function;
+    Diag.Section = Function.Section;
+    Diag.Offset = Function.Offset;
+    return fail<uint64_t>(std::move(Diag));
+  }
+  if (Function.Offset > UINT64_MAX - Section.InputAddress) {
+    Diagnostic Diag{"compact unwind function address overflows"};
+    Diag.Symbol = Value.Function;
+    return fail<uint64_t>(std::move(Diag));
+  }
+  const uint64_t Address = Section.InputAddress + Function.Offset;
+  if (Value.Length > UINT64_MAX - Address) {
+    Diagnostic Diag{"compact unwind function address overflows"};
+    Diag.Symbol = Value.Function;
+    return fail<uint64_t>(std::move(Diag));
+  }
+  return Address;
+}
+
+LinkExpect<void>
+validateCompactUnwindSymbol(std::optional<SymbolId> Id, std::string_view Name,
+                            const std::vector<Section> &Sections,
+                            const std::vector<Symbol> &Symbols,
+                            bool RequireEHFrame) {
+  if (!Id)
+    return {};
+  if (*Id >= Symbols.size()) {
+    Diagnostic Diag{"invalid compact unwind " + std::string(Name) +
+                    " symbol ID"};
+    Diag.Symbol = *Id;
+    return fail<void>(std::move(Diag));
+  }
+  const auto &Symbol = Symbols[*Id];
+  if (Symbol.Section >= Sections.size()) {
+    Diagnostic Diag{"invalid compact unwind " + std::string(Name) +
+                    " section ID"};
+    Diag.Symbol = *Id;
+    Diag.Section = Symbol.Section;
+    Diag.Offset = Symbol.Offset;
+    Diag.SymbolName = Symbol.Name;
+    return fail<void>(std::move(Diag));
+  }
+  const auto &Section = Sections[Symbol.Section];
+  const auto FailForSymbol = [&](std::string Message) {
+    Diagnostic Diag{std::move(Message)};
+    Diag.Symbol = *Id;
+    Diag.Section = Symbol.Section;
+    Diag.Offset = Symbol.Offset;
+    Diag.SymbolName = Symbol.Name;
+    Diag.SectionName = Section.Name;
+    return fail<void>(std::move(Diag));
+  };
+  if (Symbol.Offset >= Section.VirtualSize) {
+    return FailForSymbol("compact unwind symbol is outside section storage");
+  }
+  if (RequireEHFrame && Section.Purpose != SectionPurpose::EHFrame) {
+    return FailForSymbol(
+        "compact unwind FDE must reference an EH frame section");
+  }
+  if (!RequireEHFrame && Section.Kind == SectionKind::BSS) {
+    return FailForSymbol("compact unwind " + std::string(Name) +
+                         " must reference a non-BSS section");
+  }
+  return {};
+}
+
+LinkExpect<uint64_t>
+validateCompactUnwindRecord(const CompactUnwindRecord &Value,
+                            const std::vector<Section> &Sections,
+                            const std::vector<Symbol> &Symbols) {
+  auto Address = compactUnwindAddress(Value, Sections, Symbols);
+  if (!Address)
+    return Unexpected<Diagnostic>(std::move(Address.error()));
+  auto Personality = validateCompactUnwindSymbol(
+      Value.Personality, "personality", Sections, Symbols, false);
+  if (!Personality)
+    return fail<uint64_t>(std::move(Personality.error()));
+  auto LSDA =
+      validateCompactUnwindSymbol(Value.LSDA, "LSDA", Sections, Symbols, false);
+  if (!LSDA)
+    return fail<uint64_t>(std::move(LSDA.error()));
+  auto FDE =
+      validateCompactUnwindSymbol(Value.FDE, "FDE", Sections, Symbols, true);
+  if (!FDE)
+    return fail<uint64_t>(std::move(FDE.error()));
+  return *Address;
+}
+
+LinkExpect<void> validateCompactUnwindOrder(const CompactUnwindRecord &Previous,
+                                            uint64_t PreviousAddress,
+                                            uint64_t Address) {
+  if (Address < PreviousAddress)
+    return fail<void>(Diagnostic{"compact unwind records are unordered"});
+  if (Address == PreviousAddress) {
+    return fail<void>(Diagnostic{"duplicate compact unwind function address"});
+  }
+  if (Address - PreviousAddress < Previous.Length) {
+    return fail<void>(Diagnostic{"overlapping compact unwind function ranges"});
+  }
+  return {};
+}
+
 } // namespace
 
 std::optional<uint8_t> relocationPatchSize(ObjectFormat Format,
@@ -288,6 +419,8 @@ LinkExpect<void> LinkGraph::beginInput(std::string_view Name) {
 }
 
 LinkExpect<SectionId> LinkGraph::addSection(Section Value) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<SectionId>(Diagnostic{"Mach-O unwind info is populated"});
   if (RelocationsApplied) {
     return fail<SectionId>(
         Diagnostic{"link graph relocations already applied"});
@@ -316,6 +449,8 @@ LinkExpect<SectionId> LinkGraph::addSection(Section Value) {
 }
 
 LinkExpect<SymbolId> LinkGraph::addSymbol(Symbol Value) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<SymbolId>(Diagnostic{"Mach-O unwind info is populated"});
   if (RelocationsApplied) {
     return fail<SymbolId>(Diagnostic{"link graph relocations already applied"});
   }
@@ -360,6 +495,8 @@ LinkExpect<SymbolId> LinkGraph::addSymbol(Symbol Value) {
 }
 
 LinkExpect<void> LinkGraph::addRelocation(Relocation Value) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
   if (RelocationsApplied) {
     return relocated();
   }
@@ -437,6 +574,8 @@ void LinkGraph::removeEHFrameRelocations(Span<const uint8_t> Remove) {
 }
 
 LinkExpect<void> LinkGraph::addRebase(Rebase Value) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
   if (RelocationsApplied) {
     return relocated();
   }
@@ -472,11 +611,208 @@ LinkExpect<void> LinkGraph::addRebase(Rebase Value) {
 }
 
 LinkExpect<void> LinkGraph::addEHFrameReference(EHFrameReference Value) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
+  if (RelocationsApplied)
+    return relocated();
   if (Value.Section >= Sections.size() || Value.Symbol >= Symbols.size() ||
       Sections[Value.Section].Purpose != SectionPurpose::EHFrame ||
       extendsBeyond(Value.Offset, 8, Sections[Value.Section].Content.size()))
     return fail<void>(Diagnostic{"invalid EH frame reference"});
   EHFrameReferences.push_back(Value);
+  return {};
+}
+
+LinkExpect<void> LinkGraph::addCompactUnwind(CompactUnwindRecord Value) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
+  if (RelocationsApplied)
+    return relocated();
+  if (FormatValue != ObjectFormat::MachO) {
+    return fail<void>(
+        Diagnostic{"compact unwind requires a Mach-O link graph"});
+  }
+  auto Address = validateCompactUnwindRecord(Value, Sections, Symbols);
+  if (!Address)
+    return fail<void>(std::move(Address.error()));
+  if (!CompactUnwind.empty()) {
+    auto PreviousAddress =
+        compactUnwindAddress(CompactUnwind.back(), Sections, Symbols);
+    if (!PreviousAddress)
+      return fail<void>(std::move(PreviousAddress.error()));
+    auto Ordered = validateCompactUnwindOrder(CompactUnwind.back(),
+                                              *PreviousAddress, *Address);
+    if (!Ordered)
+      return Ordered;
+  }
+  CompactUnwind.push_back(std::move(Value));
+  return {};
+}
+
+LinkExpect<void> LinkGraph::pruneUnreferencedMachOEHFrame() {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
+  if (RelocationsApplied)
+    return relocated();
+  if (FormatValue != ObjectFormat::MachO || CompactUnwind.empty() ||
+      !EHFrameReferences.empty() ||
+      std::any_of(Relocations.begin(), Relocations.end(),
+                  [&](const auto &Value) {
+                    return Value.Section < Sections.size() &&
+                           Sections[Value.Section].Purpose ==
+                               SectionPurpose::EHFrame;
+                  }) ||
+      std::any_of(CompactUnwind.begin(), CompactUnwind.end(),
+                  [](const auto &Record) { return Record.FDE.has_value(); }))
+    return {};
+
+  std::vector<SectionId> SectionMap(Sections.size(), InvalidSectionId);
+  std::vector<Section> NewSections;
+  NewSections.reserve(Sections.size());
+  for (SectionId I = 0; I < Sections.size(); ++I) {
+    if (Sections[I].Purpose == SectionPurpose::EHFrame)
+      continue;
+    SectionMap[I] = static_cast<SectionId>(NewSections.size());
+    NewSections.push_back(Sections[I]);
+  }
+  if (NewSections.size() == Sections.size())
+    return {};
+  for (auto &Section : NewSections) {
+    if (!Section.LinkedSection)
+      continue;
+    if (SectionMap[*Section.LinkedSection] == InvalidSectionId)
+      return fail<void>(Diagnostic{"section links to pruned EH frame"});
+    Section.LinkedSection = SectionMap[*Section.LinkedSection];
+  }
+
+  std::vector<SymbolId> SymbolMap(Symbols.size(), InvalidSymbolId);
+  std::vector<Symbol> NewSymbols;
+  NewSymbols.reserve(Symbols.size());
+  for (SymbolId I = 0; I < Symbols.size(); ++I) {
+    if (SectionMap[Symbols[I].Section] == InvalidSectionId)
+      continue;
+    SymbolMap[I] = static_cast<SymbolId>(NewSymbols.size());
+    NewSymbols.push_back(Symbols[I]);
+    NewSymbols.back().Section = SectionMap[Symbols[I].Section];
+  }
+
+  std::vector<Relocation> NewRelocations;
+  NewRelocations.reserve(Relocations.size());
+  for (const auto &RelocationValue : Relocations) {
+    if (SectionMap[RelocationValue.Section] == InvalidSectionId)
+      continue;
+    if (SymbolMap[RelocationValue.Symbol] == InvalidSymbolId)
+      return fail<void>(Diagnostic{"relocation targets pruned EH frame"});
+    NewRelocations.push_back(RelocationValue);
+    NewRelocations.back().Section = SectionMap[RelocationValue.Section];
+    NewRelocations.back().Symbol = SymbolMap[RelocationValue.Symbol];
+  }
+
+  std::vector<Rebase> NewRebases;
+  NewRebases.reserve(Rebases.size());
+  for (const auto &RebaseValue : Rebases) {
+    if (SectionMap[RebaseValue.Section] == InvalidSectionId)
+      continue;
+    NewRebases.push_back(RebaseValue);
+    NewRebases.back().Section = SectionMap[RebaseValue.Section];
+  }
+
+  std::vector<CompactUnwindRecord> NewCompactUnwind = CompactUnwind;
+  for (auto &Record : NewCompactUnwind) {
+    if (SymbolMap[Record.Function] == InvalidSymbolId ||
+        (Record.Personality &&
+         SymbolMap[*Record.Personality] == InvalidSymbolId) ||
+        (Record.LSDA && SymbolMap[*Record.LSDA] == InvalidSymbolId))
+      return fail<void>(Diagnostic{"compact unwind targets pruned EH frame"});
+    Record.Function = SymbolMap[Record.Function];
+    if (Record.Personality)
+      Record.Personality = SymbolMap[*Record.Personality];
+    if (Record.LSDA)
+      Record.LSDA = SymbolMap[*Record.LSDA];
+  }
+
+  LinkGraph Candidate(TargetValue, EndianValue, FormatValue);
+  Candidate.ELFFlags = ELFFlags;
+  Candidate.InputName = InputName;
+  Candidate.Sections = std::move(NewSections);
+  Candidate.Symbols = std::move(NewSymbols);
+  Candidate.Relocations = std::move(NewRelocations);
+  Candidate.Rebases = std::move(NewRebases);
+  Candidate.CompactUnwind = std::move(NewCompactUnwind);
+  Candidate.UnwindInfoState = UnwindInfoState;
+  if (!Candidate.validate())
+    return fail<void>(Diagnostic{"invalid graph after pruning EH frame"});
+  Sections.swap(Candidate.Sections);
+  Symbols.swap(Candidate.Symbols);
+  Relocations.swap(Candidate.Relocations);
+  Rebases.swap(Candidate.Rebases);
+  EHFrameReferences.clear();
+  CompactUnwind.swap(Candidate.CompactUnwind);
+  return {};
+}
+
+LinkExpect<void> LinkGraph::reserveMachOUnwindInfoSection(Section Value) {
+  if (RelocationsApplied || UnwindInfoState != MachOUnwindInfoState::None ||
+      FormatValue != ObjectFormat::MachO || CompactUnwind.empty() ||
+      Value.Purpose != SectionPurpose::UnwindInfo ||
+      Value.Name != "__unwind_info" || Value.Kind != SectionKind::Unwind ||
+      Value.Content.size() != Value.VirtualSize)
+    return fail<void>(Diagnostic{"invalid Mach-O unwind info reservation"});
+  auto NewSections = Sections;
+  NewSections.push_back(std::move(Value));
+  Sections.swap(NewSections);
+  UnwindInfoState = MachOUnwindInfoState::Reserved;
+  return {};
+}
+
+LinkExpect<void>
+LinkGraph::populateMachOUnwindInfoSection(SectionId Id,
+                                          std::vector<Byte> Content) {
+  if (!RelocationsApplied ||
+      UnwindInfoState != MachOUnwindInfoState::Reserved ||
+      Id >= Sections.size() ||
+      Sections[Id].Purpose != SectionPurpose::UnwindInfo ||
+      Sections[Id].Name != "__unwind_info" ||
+      Sections[Id].Kind != SectionKind::Unwind ||
+      Content.size() != Sections[Id].VirtualSize)
+    return fail<void>(Diagnostic{"invalid Mach-O unwind info population"});
+  Sections[Id].Content.swap(Content);
+  UnwindInfoState = MachOUnwindInfoState::Populated;
+  return {};
+}
+
+LinkExpect<void>
+LinkGraph::addSynthesizedEHFrame(std::optional<SectionId> Existing,
+                                 Section Value,
+                                 std::vector<EHFrameReference> References) {
+  if (RelocationsApplied ||
+      UnwindInfoState == MachOUnwindInfoState::Populated ||
+      Value.Purpose != SectionPurpose::EHFrame ||
+      Value.Kind != SectionKind::Unwind ||
+      Value.Content.size() != Value.VirtualSize)
+    return fail<void>(Diagnostic{"invalid synthesized EH frame"});
+  if (Existing && (*Existing >= Sections.size() ||
+                   Sections[*Existing].Purpose != SectionPurpose::EHFrame))
+    return fail<void>(Diagnostic{"invalid synthesized EH frame section"});
+  const SectionId Id =
+      Existing ? *Existing : static_cast<SectionId>(Sections.size());
+  for (auto &Reference : References) {
+    if (Reference.Section != InvalidSectionId ||
+        Reference.Symbol >= Symbols.size() ||
+        extendsBeyond(Reference.Offset, 8, Value.Content.size()))
+      return fail<void>(Diagnostic{"invalid synthesized EH frame reference"});
+    Reference.Section = Id;
+  }
+  auto NewSections = Sections;
+  auto NewReferences = EHFrameReferences;
+  if (Existing)
+    NewSections[*Existing] = std::move(Value);
+  else
+    NewSections.push_back(std::move(Value));
+  NewReferences.insert(NewReferences.end(), References.begin(),
+                       References.end());
+  Sections.swap(NewSections);
+  EHFrameReferences.swap(NewReferences);
   return {};
 }
 
@@ -505,6 +841,25 @@ LinkExpect<void> LinkGraph::validate() const {
       Diag.SectionName = Value.Name;
       return fail<void>(std::move(Diag));
     }
+  }
+  const auto UnwindInfoCount =
+      std::count_if(Sections.begin(), Sections.end(), [](const auto &Section) {
+        return Section.Purpose == SectionPurpose::UnwindInfo;
+      });
+  if ((UnwindInfoState == MachOUnwindInfoState::None && UnwindInfoCount != 0) ||
+      (UnwindInfoState != MachOUnwindInfoState::None &&
+       (FormatValue != ObjectFormat::MachO || CompactUnwind.empty() ||
+        UnwindInfoCount != 1)))
+    return fail<void>(Diagnostic{"incoherent Mach-O unwind info state"});
+  if (UnwindInfoState != MachOUnwindInfoState::None) {
+    const auto &UnwindInfo = *std::find_if(
+        Sections.begin(), Sections.end(), [](const auto &Section) {
+          return Section.Purpose == SectionPurpose::UnwindInfo;
+        });
+    if (UnwindInfo.Name != "__unwind_info" ||
+        UnwindInfo.Kind != SectionKind::Unwind ||
+        UnwindInfo.Content.size() != UnwindInfo.VirtualSize)
+      return fail<void>(Diagnostic{"incoherent Mach-O unwind info section"});
   }
   for (size_t I = 0; I < Symbols.size(); ++I) {
     const auto &Value = Symbols[I];
@@ -612,10 +967,30 @@ LinkExpect<void> LinkGraph::validate() const {
       }
     }
   }
+  if (!CompactUnwind.empty() && FormatValue != ObjectFormat::MachO) {
+    return fail<void>(
+        Diagnostic{"compact unwind requires a Mach-O link graph"});
+  }
+  std::optional<uint64_t> PreviousAddress;
+  for (size_t I = 0; I < CompactUnwind.size(); ++I) {
+    auto Address =
+        validateCompactUnwindRecord(CompactUnwind[I], Sections, Symbols);
+    if (!Address)
+      return fail<void>(std::move(Address.error()));
+    if (PreviousAddress) {
+      auto Ordered = validateCompactUnwindOrder(CompactUnwind[I - 1],
+                                                *PreviousAddress, *Address);
+      if (!Ordered)
+        return Ordered;
+    }
+    PreviousAddress = *Address;
+  }
   return {};
 }
 
 LinkExpect<void> LinkGraph::setSectionAddress(SectionId Id, uint64_t Address) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
   if (RelocationsApplied) {
     return relocated();
   }
@@ -630,6 +1005,8 @@ LinkExpect<void> LinkGraph::setSectionAddress(SectionId Id, uint64_t Address) {
 
 LinkExpect<void> LinkGraph::setSectionFileOffset(SectionId Id,
                                                  uint64_t FileOffset) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
   if (RelocationsApplied) {
     return relocated();
   }
@@ -654,6 +1031,8 @@ LinkExpect<void> LinkGraph::setELFFlags(uint32_t Flags) {
 }
 
 LinkExpect<void> LinkGraph::setLinkedSection(SectionId Id, SectionId Linked) {
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
   if (RelocationsApplied) {
     return relocated();
   }
@@ -664,17 +1043,39 @@ LinkExpect<void> LinkGraph::setLinkedSection(SectionId Id, SectionId Linked) {
   return {};
 }
 
-LinkExpect<Span<Byte>> LinkGraph::sectionContent(SectionId Id) {
-  if (RelocationsApplied) {
-    return fail<Span<Byte>>(
-        Diagnostic{"link graph relocations already applied"});
-  }
+LinkExpect<Span<const Byte>> LinkGraph::sectionContent(SectionId Id) const {
   if (Id >= Sections.size()) {
     Diagnostic Diag{"invalid section ID"};
     Diag.Section = Id;
-    return fail<Span<Byte>>(std::move(Diag));
+    return fail<Span<const Byte>>(std::move(Diag));
   }
-  return Span<Byte>(Sections[Id].Content.data(), Sections[Id].Content.size());
+  return Span<const Byte>(Sections[Id].Content.data(),
+                          Sections[Id].Content.size());
+}
+
+LinkExpect<void> LinkGraph::writeSectionContent(SectionId Id, uint64_t Offset,
+                                                Span<const Byte> Content) {
+  if (RelocationsApplied)
+    return relocated();
+  if (UnwindInfoState == MachOUnwindInfoState::Populated)
+    return fail<void>(Diagnostic{"Mach-O unwind info is populated"});
+  if (Id >= Sections.size()) {
+    Diagnostic Diag{"invalid section ID"};
+    Diag.Section = Id;
+    return fail<void>(std::move(Diag));
+  }
+  if (Offset > Sections[Id].Content.size() ||
+      Content.size() > Sections[Id].Content.size() - Offset) {
+    Diagnostic Diag{"section content write is outside section content"};
+    Diag.Section = Id;
+    Diag.SectionName = Sections[Id].Name;
+    Diag.Offset = Offset;
+    return fail<void>(std::move(Diag));
+  }
+  auto NewContent = Sections[Id].Content;
+  std::copy(Content.begin(), Content.end(), NewContent.begin() + Offset);
+  Sections[Id].Content.swap(NewContent);
+  return {};
 }
 
 } // namespace Linker

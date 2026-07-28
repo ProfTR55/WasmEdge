@@ -7,6 +7,7 @@
 #include "linker/link_graph.h"
 
 #include <cstdint>
+#include <set>
 #include <vector>
 
 namespace WasmEdge {
@@ -23,6 +24,8 @@ Expect<uint64_t> resolveMachOFDEAddress(uint64_t LoadBase,
 } // namespace Internal
 
 Expect<void> normalizeMachOEHFrame(LinkGraph &Graph);
+Expect<std::set<size_t>> machOEHFrameFields(Span<const Byte> Bytes,
+                                           Target Architecture);
 Expect<void> validateMachOEHFrameCoverage(const LinkGraph &Graph);
 Expect<std::vector<uint64_t>> machOEHFrameStarts(const LinkGraph &Graph,
                                                  uint64_t LoadBase);

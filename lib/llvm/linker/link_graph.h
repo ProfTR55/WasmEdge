@@ -28,9 +28,11 @@ enum class SectionPurpose : uint8_t {
   PData,
   XData,
   CompactUnwind,
+  UnwindInfo,
   ARMExidx,
 };
 enum class ObjectFormat : uint8_t { ELF, MachO, COFF };
+enum class MachOUnwindInfoState : uint8_t { None, Reserved, Populated };
 
 using SectionId = uint32_t;
 using SymbolId = uint32_t;
@@ -56,6 +58,15 @@ struct EHFrameReference {
   SectionId Section;
   uint64_t Offset;
   SymbolId Symbol;
+};
+
+struct CompactUnwindRecord {
+  SymbolId Function;
+  uint32_t Length;
+  uint32_t Encoding;
+  std::optional<SymbolId> Personality;
+  std::optional<SymbolId> LSDA;
+  std::optional<SymbolId> FDE;
 };
 
 struct Symbol {
@@ -124,12 +135,16 @@ public:
   LinkExpect<void> addRelocation(Relocation Value);
   LinkExpect<void> addRebase(Rebase Value);
   LinkExpect<void> addEHFrameReference(EHFrameReference Value);
+  LinkExpect<void> addCompactUnwind(CompactUnwindRecord Value);
+  LinkExpect<void> pruneUnreferencedMachOEHFrame();
   LinkExpect<void> validate() const;
   LinkExpect<void> setSectionAddress(SectionId Id, uint64_t Address);
   LinkExpect<void> setSectionFileOffset(SectionId Id, uint64_t FileOffset);
   LinkExpect<void> setLinkedSection(SectionId Id, SectionId Linked);
   LinkExpect<void> setELFFlags(uint32_t Flags);
-  LinkExpect<Span<Byte>> sectionContent(SectionId Id);
+  LinkExpect<Span<const Byte>> sectionContent(SectionId Id) const;
+  LinkExpect<void> writeSectionContent(SectionId Id, uint64_t Offset,
+                                       Span<const Byte> Content);
 
   Target target() const noexcept { return TargetValue; }
   Endianness endianness() const noexcept { return EndianValue; }
@@ -144,7 +159,13 @@ public:
   const std::vector<EHFrameReference> &ehFrameReferences() const noexcept {
     return EHFrameReferences;
   }
+  const std::vector<CompactUnwindRecord> &compactUnwind() const noexcept {
+    return CompactUnwind;
+  }
   bool relocationsApplied() const noexcept { return RelocationsApplied; }
+  MachOUnwindInfoState machOUnwindInfoState() const noexcept {
+    return UnwindInfoState;
+  }
 
 private:
   Target TargetValue;
@@ -157,9 +178,14 @@ private:
   std::vector<Relocation> Relocations;
   std::vector<Rebase> Rebases;
   std::vector<EHFrameReference> EHFrameReferences;
+  std::vector<CompactUnwindRecord> CompactUnwind;
+  MachOUnwindInfoState UnwindInfoState = MachOUnwindInfoState::None;
   bool RelocationsApplied = false;
 
   friend Expect<void> applyRelocations(LinkGraph &);
+  friend Expect<void> compactUnwindToEHFrame(LinkGraph &);
+  friend Expect<void> reserveMachOUnwindInfo(LinkGraph &);
+  friend Expect<void> populateMachOUnwindInfo(LinkGraph &, uint64_t);
   friend Expect<void> normalizeMachOEHFrame(LinkGraph &);
 
   Span<Section> mutableSectionsForEHFrame() noexcept { return Sections; }
@@ -167,6 +193,12 @@ private:
     return Relocations;
   }
   void removeEHFrameRelocations(Span<const uint8_t> Remove);
+  LinkExpect<void>
+  addSynthesizedEHFrame(std::optional<SectionId> Existing, Section Value,
+                        std::vector<EHFrameReference> References);
+  LinkExpect<void> reserveMachOUnwindInfoSection(Section Value);
+  LinkExpect<void> populateMachOUnwindInfoSection(SectionId Id,
+                                                  std::vector<Byte> Content);
 };
 
 } // namespace Linker

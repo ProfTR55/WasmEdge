@@ -53,7 +53,7 @@ uint64_t pageSize(Target Architecture) noexcept {
   return Architecture == Target::AArch64 ? ARMPageSize : X86PageSize;
 }
 
-bool supported(const LinkGraph &Graph) noexcept {
+bool supported(const LinkGraph &Graph, bool RequireFinalized) noexcept {
   const bool HasEH = std::any_of(
       Graph.sections().begin(), Graph.sections().end(), [](const auto &Value) {
         return Value.Purpose == SectionPurpose::EHFrame;
@@ -62,11 +62,21 @@ bool supported(const LinkGraph &Graph) noexcept {
       Graph.sections().begin(), Graph.sections().end(), [](const auto &Value) {
         return Value.Purpose == SectionPurpose::CompactUnwind;
       });
+  const bool HasUnwindInfo = std::any_of(
+      Graph.sections().begin(), Graph.sections().end(), [](const auto &Value) {
+        return Value.Purpose == SectionPurpose::UnwindInfo;
+      });
+  const bool HasCompactRecords = !Graph.compactUnwind().empty();
+  const auto UnwindInfoState = Graph.machOUnwindInfoState();
   return Graph.format() == ObjectFormat::MachO &&
          Graph.endianness() == Endianness::Little &&
          (Graph.target() == Target::X86_64 ||
           Graph.target() == Target::AArch64) &&
-         HasEH && !HasCompact;
+         (HasEH || HasUnwindInfo) && !HasCompact &&
+         (!HasCompactRecords ||
+          UnwindInfoState != MachOUnwindInfoState::None) &&
+         (!RequireFinalized || !HasUnwindInfo ||
+          UnwindInfoState == MachOUnwindInfoState::Populated);
 }
 
 uint64_t dylibCommandSize() noexcept {
@@ -284,7 +294,8 @@ uint32_t alignmentPower(uint64_t Alignment) noexcept {
 
 Expect<void> MachOWriter::layout(LinkGraph &Graph) noexcept {
   try {
-    if (!supported(Graph) || Graph.relocationsApplied() || !Graph.validate())
+    if (!supported(Graph, false) || Graph.relocationsApplied() ||
+        !Graph.validate())
       return fail();
     uint64_t Cursor = 0;
     if (!add(HeaderSize, loadCommandSize(Graph), Cursor) ||
@@ -331,7 +342,8 @@ Expect<void> MachOWriter::layout(LinkGraph &Graph) noexcept {
 Expect<void> MachOWriter::write(const LinkGraph &Graph,
                                 Writer &Output) noexcept {
   try {
-    if (!supported(Graph) || !Graph.relocationsApplied() || !Graph.validate())
+    if (!supported(Graph, true) || !Graph.relocationsApplied() ||
+        !Graph.validate())
       return fail();
     if (Graph.sections().size() > UINT8_MAX ||
         Graph.symbols().size() > UINT32_MAX ||

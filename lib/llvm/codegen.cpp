@@ -9,9 +9,6 @@
 #include "llvm.h"
 
 #include <fstream>
-#if WASMEDGE_OS_MACOS && LLVM_VERSION_MAJOR >= 15
-#include <llvm/Target/TargetMachine.h>
-#endif
 
 namespace LLVM = WasmEdge::LLVM;
 using namespace std::literals;
@@ -113,38 +110,8 @@ Expect<void> CodeGen::codegen(Span<const Byte> WasmData, Data D,
       }
     }
 
-#if WASMEDGE_OS_MACOS
-    constexpr std::string_view UnwindAnchor = R"(
-.private_extern _wasmedge_unwind_anchor
-_wasmedge_unwind_anchor:
-  .cfi_startproc
-  .cfi_def_cfa_offset 16
-  .cfi_escape 0x2e, 0x10
-  ret
-  .cfi_endproc
-)"sv;
-    std::string OriginalAssembly;
-#if LLVM_VERSION_MAJOR >= 15
-    auto *TargetMachine = reinterpret_cast<llvm::TargetMachine *>(TM.unwrap());
-    auto OriginalDwarfUnwind = TargetMachine->Options.MCOptions.EmitDwarfUnwind;
-#endif
-    OriginalAssembly = LLModule.getInlineAsm();
-    std::string Assembly = OriginalAssembly;
-    Assembly.append(UnwindAnchor);
-    LLModule.setInlineAsm(Assembly);
-#if LLVM_VERSION_MAJOR >= 15
-    TargetMachine->Options.MCOptions.EmitDwarfUnwind =
-        llvm::EmitDwarfUnwindType::Always;
-#endif
-#endif
     auto [OSVec, ErrorMessage] =
         TM.emitToMemoryBuffer(LLModule, LLVMObjectFile);
-#if WASMEDGE_OS_MACOS
-    LLModule.setInlineAsm(OriginalAssembly);
-#if LLVM_VERSION_MAJOR >= 15
-    TargetMachine->Options.MCOptions.EmitDwarfUnwind = OriginalDwarfUnwind;
-#endif
-#endif
     if (ErrorMessage) {
       // TODO:return error
       spdlog::error("addPassesToEmitFile failed"sv);

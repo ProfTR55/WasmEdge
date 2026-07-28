@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace WasmEdge {
 namespace LLVM {
@@ -34,6 +35,31 @@ std::optional<std::map<std::string, std::string>>
 parseCOFFExports(std::string_view Directives);
 bool supportsMachORelocationMetadata(Target TargetValue,
                                      bool Scattered) noexcept;
+
+struct CompactUnwindRelocation {
+  uint64_t Offset;
+  uint32_t Type;
+  uint8_t PatchSize;
+  bool PCRelative;
+  bool External;
+  bool Scattered;
+};
+
+struct DecodedCompactUnwindRecord {
+  uint64_t Function;
+  uint32_t Length;
+  uint32_t Encoding;
+  uint64_t Personality;
+  uint64_t LSDA;
+};
+
+LinkExpect<std::vector<DecodedCompactUnwindRecord>>
+parseCompactUnwindSection(Target TargetValue, Span<const Byte> Content,
+                          Span<const CompactUnwindRelocation> Relocations);
+LinkExpect<uint64_t>
+resolveCompactUnwindTargetOffset(bool External, uint64_t SectionAddress,
+                                  uint64_t SymbolOffset,
+                                  uint64_t RawAddend);
 
 } // namespace Internal
 

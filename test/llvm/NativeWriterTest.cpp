@@ -10,6 +10,8 @@
 #pragma warning(pop)
 #endif
 
+#include "linker/compact_unwind.h"
+#include "linker/eh_frame.h"
 #include "linker/elf_writer.h"
 #include "linker/macho_writer.h"
 #include "linker/native_linker.h"
@@ -47,6 +49,16 @@
 namespace {
 
 using namespace WasmEdge::LLVM::Linker;
+
+template <typename F>
+bool mutateSectionContent(LinkGraph &Graph, SectionId Id, F &&Mutate) {
+  auto Content = Graph.sectionContent(Id);
+  if (!Content)
+    return false;
+  std::vector<WasmEdge::Byte> Copy(Content->begin(), Content->end());
+  Mutate(Copy);
+  return static_cast<bool>(Graph.writeSectionContent(Id, 0, Copy));
+}
 
 LinkGraph makePEGraph(Target Architecture) {
   LinkGraph Graph(Architecture, Endianness::Little, ObjectFormat::COFF);
@@ -270,23 +282,24 @@ TEST(PEWriterTest, WritesDeterministicPE32PlusDLLs) {
   for (const auto Architecture : {Target::X86_64, Target::AArch64}) {
     auto Graph = makePEGraph(Architecture);
     ASSERT_TRUE(PEWriter::layout(Graph));
-    auto Data = Graph.sectionContent(2);
-    auto PData = Graph.sectionContent(4);
-    ASSERT_TRUE(Data && PData);
-    for (uint8_t I = 0; I < 8; ++I)
-      (*Data)[I] =
-          static_cast<WasmEdge::Byte>(Graph.sections()[0].Address >> (I * 8));
-    auto WritePData = [&](size_t Offset, uint64_t Value) {
-      for (uint8_t I = 0; I < 4; ++I)
-        (*PData)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
-    };
-    WritePData(0, Graph.sections()[0].Address - ImageBase);
-    WritePData(4,
-               (Architecture == Target::X86_64 ? Graph.sections()[0].Address + 4
-                                               : Graph.sections()[5].Address) -
-                   ImageBase);
-    if (Architecture == Target::X86_64)
-      WritePData(8, Graph.sections()[5].Address - ImageBase);
+    ASSERT_TRUE(mutateSectionContent(Graph, 2, [&](auto &Data) {
+      for (uint8_t I = 0; I < 8; ++I)
+        Data[I] =
+            static_cast<WasmEdge::Byte>(Graph.sections()[0].Address >> (I * 8));
+    }));
+    ASSERT_TRUE(mutateSectionContent(Graph, 4, [&](auto &PData) {
+      auto WritePData = [&](size_t Offset, uint64_t Value) {
+        for (uint8_t I = 0; I < 4; ++I)
+          PData[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+      };
+      WritePData(0, Graph.sections()[0].Address - ImageBase);
+      WritePData(4, (Architecture == Target::X86_64
+                         ? Graph.sections()[0].Address + 4
+                         : Graph.sections()[5].Address) -
+                        ImageBase);
+      if (Architecture == Target::X86_64)
+        WritePData(8, Graph.sections()[5].Address - ImageBase);
+    }));
     ASSERT_TRUE(applyRelocations(Graph));
 
     std::vector<WasmEdge::Byte> Bytes;
@@ -507,10 +520,10 @@ TEST(PEWriterTest, SortsRuntimeFunctionTables) {
     ASSERT_TRUE(Text && XData && PDataA && PDataB);
     ASSERT_TRUE(PEWriter::layout(Graph));
     auto Write32 = [&](SectionId Section, size_t Offset, uint32_t Value) {
-      auto Content = Graph.sectionContent(Section);
-      ASSERT_TRUE(Content);
+      std::array<WasmEdge::Byte, 4> Content{};
       for (uint8_t I = 0; I < 4; ++I)
-        (*Content)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+        Content[I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+      ASSERT_TRUE(Graph.writeSectionContent(Section, Offset, Content));
     };
     const uint32_t TextRVA =
         static_cast<uint32_t>(Graph.sections()[*Text].Address - ImageBase);
@@ -565,17 +578,18 @@ TEST(PEWriterTest, RejectsSymbolsReferencingSortedRuntimeFunctions) {
   ASSERT_TRUE(
       Graph.addSymbol(Symbol{"bad_pdata", 4, 0, 12, true, std::nullopt, true}));
   ASSERT_TRUE(PEWriter::layout(Graph));
-  auto PData = Graph.sectionContent(4);
-  ASSERT_TRUE(PData);
   constexpr uint64_t ImageBase = UINT64_C(0x180000000);
   const uint32_t TextRVA =
       static_cast<uint32_t>(Graph.sections()[0].Address - ImageBase);
   const uint32_t XDataRVA =
       static_cast<uint32_t>(Graph.sections()[5].Address - ImageBase);
-  for (const auto &[Offset, Value] : std::array<std::pair<size_t, uint32_t>, 3>{
-           {{0, TextRVA}, {4, TextRVA + 4}, {8, XDataRVA}}})
-    for (uint8_t I = 0; I < 4; ++I)
-      (*PData)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+  ASSERT_TRUE(mutateSectionContent(Graph, 4, [&](auto &PData) {
+    for (const auto &[Offset, Value] :
+         std::array<std::pair<size_t, uint32_t>, 3>{
+             {{0, TextRVA}, {4, TextRVA + 4}, {8, XDataRVA}}})
+      for (uint8_t I = 0; I < 4; ++I)
+        PData[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+  }));
   ASSERT_TRUE(applyRelocations(Graph));
   std::vector<WasmEdge::Byte> Bytes;
   Writer Output(Bytes);
@@ -588,23 +602,23 @@ TEST(PEWriterTest, RejectsInvalidRuntimeFunctionTables) {
   for (const auto Architecture : {Target::X86_64, Target::AArch64}) {
     auto Graph = makePEGraph(Architecture);
     ASSERT_TRUE(PEWriter::layout(Graph));
-    auto PData = Graph.sectionContent(4);
-    ASSERT_TRUE(PData);
     const uint32_t TextRVA =
         static_cast<uint32_t>(Graph.sections()[0].Address - ImageBase);
     const uint32_t XDataRVA =
         static_cast<uint32_t>(Graph.sections()[5].Address - ImageBase);
-    auto Write = [&](size_t Offset, uint32_t Value) {
-      for (uint8_t I = 0; I < 4; ++I)
-        (*PData)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
-    };
-    Write(0, TextRVA);
-    if (Architecture == Target::X86_64) {
-      Write(4, TextRVA);
-      Write(8, XDataRVA + 8);
-    } else {
-      Write(4, XDataRVA + 8);
-    }
+    ASSERT_TRUE(mutateSectionContent(Graph, 4, [&](auto &PData) {
+      auto Write = [&](size_t Offset, uint32_t Value) {
+        for (uint8_t I = 0; I < 4; ++I)
+          PData[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+      };
+      Write(0, TextRVA);
+      if (Architecture == Target::X86_64) {
+        Write(4, TextRVA);
+        Write(8, XDataRVA + 8);
+      } else {
+        Write(4, XDataRVA + 8);
+      }
+    }));
     ASSERT_TRUE(applyRelocations(Graph));
     std::vector<WasmEdge::Byte> Bytes;
     Writer Output(Bytes);
@@ -633,22 +647,22 @@ TEST(PEWriterTest, RejectsDuplicateAndOverlappingRuntimeFunctions) {
                                           SectionPurpose::PData});
     ASSERT_TRUE(Text && XData && PData);
     ASSERT_TRUE(PEWriter::layout(Graph));
-    auto Content = Graph.sectionContent(*PData);
-    ASSERT_TRUE(Content);
     const uint32_t TextRVA =
         static_cast<uint32_t>(Graph.sections()[*Text].Address - ImageBase);
     const uint32_t XDataRVA =
         static_cast<uint32_t>(Graph.sections()[*XData].Address - ImageBase);
-    auto Write = [&](size_t Offset, uint32_t Value) {
-      for (uint8_t I = 0; I < 4; ++I)
-        (*Content)[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
-    };
-    Write(0, TextRVA);
-    Write(4, TextRVA + 32);
-    Write(8, XDataRVA);
-    Write(12, TextRVA + (Duplicate ? 0 : 16));
-    Write(16, TextRVA + 48);
-    Write(20, XDataRVA);
+    ASSERT_TRUE(mutateSectionContent(Graph, *PData, [&](auto &Content) {
+      auto Write = [&](size_t Offset, uint32_t Value) {
+        for (uint8_t I = 0; I < 4; ++I)
+          Content[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+      };
+      Write(0, TextRVA);
+      Write(4, TextRVA + 32);
+      Write(8, XDataRVA);
+      Write(12, TextRVA + (Duplicate ? 0 : 16));
+      Write(16, TextRVA + 48);
+      Write(20, XDataRVA);
+    }));
     ASSERT_TRUE(applyRelocations(Graph));
     std::vector<WasmEdge::Byte> Bytes;
     Writer Output(Bytes);
@@ -692,29 +706,29 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
   for (const auto &Test : Cases) {
     auto Graph = makeELFGraph(Test);
     ASSERT_TRUE(ELFWriter::layout(Graph));
-    auto EHContent = Graph.sectionContent(2);
-    ASSERT_TRUE(EHContent);
-    for (size_t I = 0; I < 2; ++I) {
-      const size_t FieldOffset = 17 + I * 17 + 8;
-      const uint64_t FieldAddress = Graph.sections()[2].Address + FieldOffset;
-      const uint64_t FunctionAddress = Graph.sections()[0].Address + I * 2;
-      const int64_t Delta = static_cast<int64_t>(FunctionAddress) -
-                            static_cast<int64_t>(FieldAddress);
-      for (uint8_t Byte = 0; Byte < 4; ++Byte) {
-        const uint8_t Shift =
-            Test.Endian == Endianness::Little ? Byte : 3 - Byte;
-        (*EHContent)[FieldOffset + Byte] = static_cast<WasmEdge::Byte>(
-            static_cast<uint32_t>(Delta) >> (Shift * 8));
+    ASSERT_TRUE(mutateSectionContent(Graph, 2, [&](auto &EHContent) {
+      for (size_t I = 0; I < 2; ++I) {
+        const size_t FieldOffset = 17 + I * 17 + 8;
+        const uint64_t FieldAddress = Graph.sections()[2].Address + FieldOffset;
+        const uint64_t FunctionAddress = Graph.sections()[0].Address + I * 2;
+        const int64_t Delta = static_cast<int64_t>(FunctionAddress) -
+                              static_cast<int64_t>(FieldAddress);
+        for (uint8_t Byte = 0; Byte < 4; ++Byte) {
+          const uint8_t Shift =
+              Test.Endian == Endianness::Little ? Byte : 3 - Byte;
+          EHContent[FieldOffset + Byte] = static_cast<WasmEdge::Byte>(
+              static_cast<uint32_t>(Delta) >> (Shift * 8));
+        }
       }
-    }
-    auto Data = Graph.sectionContent(3);
-    ASSERT_TRUE(Data);
-    for (uint8_t I = 0; I < (Test.Is64 ? 8 : 4); ++I) {
-      const uint8_t Shift =
-          Test.Endian == Endianness::Little ? I : (Test.Is64 ? 7 - I : 3 - I);
-      (*Data)[I] = static_cast<WasmEdge::Byte>(Graph.sections()[3].Address >>
-                                               (Shift * 8));
-    }
+    }));
+    ASSERT_TRUE(mutateSectionContent(Graph, 3, [&](auto &Data) {
+      for (uint8_t I = 0; I < (Test.Is64 ? 8 : 4); ++I) {
+        const uint8_t Shift =
+            Test.Endian == Endianness::Little ? I : (Test.Is64 ? 7 - I : 3 - I);
+        Data[I] = static_cast<WasmEdge::Byte>(Graph.sections()[3].Address >>
+                                              (Shift * 8));
+      }
+    }));
     ASSERT_TRUE(applyRelocations(Graph));
     std::vector<WasmEdge::Byte> Bytes;
     Writer Output(Bytes);
@@ -1209,8 +1223,6 @@ TEST(ELFWriterTest, AcceptsDefinedPCRelativePersonality) {
   ASSERT_TRUE(Graph.addSymbol(
       Symbol{"personality", *Text, 2, 1, false, std::nullopt, false}));
   ASSERT_TRUE(ELFWriter::layout(Graph));
-  auto Content = Graph.sectionContent(*EH);
-  ASSERT_TRUE(Content);
   const uint64_t PersonalityField = Graph.sections()[*EH].Address + 18;
   const int64_t PersonalityDelta =
       static_cast<int64_t>(Graph.sections()[*Text].Address + 2) -
@@ -1219,12 +1231,14 @@ TEST(ELFWriterTest, AcceptsDefinedPCRelativePersonality) {
   const int64_t FunctionDelta =
       static_cast<int64_t>(Graph.sections()[*Text].Address) -
       static_cast<int64_t>(FunctionField);
-  for (uint8_t I = 0; I < 4; ++I) {
-    (*Content)[18 + I] = static_cast<WasmEdge::Byte>(
-        static_cast<uint32_t>(PersonalityDelta) >> (I * 8));
-    (*Content)[31 + I] = static_cast<WasmEdge::Byte>(
-        static_cast<uint32_t>(FunctionDelta) >> (I * 8));
-  }
+  ASSERT_TRUE(mutateSectionContent(Graph, *EH, [&](auto &Content) {
+    for (uint8_t I = 0; I < 4; ++I) {
+      Content[18 + I] = static_cast<WasmEdge::Byte>(
+          static_cast<uint32_t>(PersonalityDelta) >> (I * 8));
+      Content[31 + I] = static_cast<WasmEdge::Byte>(
+          static_cast<uint32_t>(FunctionDelta) >> (I * 8));
+    }
+  }));
   ASSERT_TRUE(applyRelocations(Graph));
   std::vector<WasmEdge::Byte> Bytes;
   Writer Output(Bytes);
@@ -1270,24 +1284,25 @@ TEST(ELFWriterTest, AcceptsIndirectPersonalityWithRelativeSlot) {
     ASSERT_TRUE(Graph.addSymbol(
         Symbol{"personality", *Text, 2, 1, false, std::nullopt, false}));
     ASSERT_TRUE(ELFWriter::layout(Graph));
-    auto DataContent = Graph.sectionContent(*Data);
-    auto EHContent = Graph.sectionContent(*EH);
-    ASSERT_TRUE(DataContent && EHContent);
-    for (uint8_t I = 0; I < 8; ++I)
-      (*DataContent)[I] = static_cast<WasmEdge::Byte>(
-          (Graph.sections()[*Text].Address + 2) >> (I * 8));
+    ASSERT_TRUE(mutateSectionContent(Graph, *Data, [&](auto &DataContent) {
+      for (uint8_t I = 0; I < 8; ++I)
+        DataContent[I] = static_cast<WasmEdge::Byte>(
+            (Graph.sections()[*Text].Address + 2) >> (I * 8));
+    }));
     const int64_t SlotDelta =
         static_cast<int64_t>(Graph.sections()[*Data].Address) -
         static_cast<int64_t>(Graph.sections()[*EH].Address + 18);
     const int64_t FunctionDelta =
         static_cast<int64_t>(Graph.sections()[*Text].Address) -
         static_cast<int64_t>(Graph.sections()[*EH].Address + 31);
-    for (uint8_t I = 0; I < 4; ++I) {
-      (*EHContent)[18 + I] = static_cast<WasmEdge::Byte>(
-          static_cast<uint32_t>(SlotDelta) >> (I * 8));
-      (*EHContent)[31 + I] = static_cast<WasmEdge::Byte>(
-          static_cast<uint32_t>(FunctionDelta) >> (I * 8));
-    }
+    ASSERT_TRUE(mutateSectionContent(Graph, *EH, [&](auto &EHContent) {
+      for (uint8_t I = 0; I < 4; ++I) {
+        EHContent[18 + I] = static_cast<WasmEdge::Byte>(
+            static_cast<uint32_t>(SlotDelta) >> (I * 8));
+        EHContent[31 + I] = static_cast<WasmEdge::Byte>(
+            static_cast<uint32_t>(FunctionDelta) >> (I * 8));
+      }
+    }));
     if (HasRebase) {
       ASSERT_TRUE(Graph.addRebase(Rebase{
           *Data, 0, static_cast<uint32_t>(llvm::ELF::R_X86_64_64), 0, 8}));
@@ -1356,20 +1371,22 @@ TEST(ELFWriterTest, AggregatesMultipleEHFrameSections) {
   ASSERT_TRUE(ELFWriter::layout(Graph));
   for (size_t SectionIndex = 0; SectionIndex < EHSections.size();
        ++SectionIndex) {
-    auto Content = Graph.sectionContent(EHSections[SectionIndex]);
-    ASSERT_TRUE(Content);
-    for (size_t I = 0; I < 2; ++I) {
-      const size_t FieldOffset = 17 + I * 17 + 8;
-      const uint64_t FieldAddress =
-          Graph.sections()[EHSections[SectionIndex]].Address + FieldOffset;
-      const uint64_t FunctionAddress =
-          Graph.sections()[*Text].Address + (SectionIndex * 2 + I) * 2;
-      const int64_t Delta = static_cast<int64_t>(FunctionAddress) -
-                            static_cast<int64_t>(FieldAddress);
-      for (uint8_t Byte = 0; Byte < 4; ++Byte)
-        (*Content)[FieldOffset + Byte] = static_cast<WasmEdge::Byte>(
-            static_cast<uint32_t>(Delta) >> (Byte * 8));
-    }
+    ASSERT_TRUE(mutateSectionContent(
+        Graph, EHSections[SectionIndex], [&](auto &Content) {
+          for (size_t I = 0; I < 2; ++I) {
+            const size_t FieldOffset = 17 + I * 17 + 8;
+            const uint64_t FieldAddress =
+                Graph.sections()[EHSections[SectionIndex]].Address +
+                FieldOffset;
+            const uint64_t FunctionAddress =
+                Graph.sections()[*Text].Address + (SectionIndex * 2 + I) * 2;
+            const int64_t Delta = static_cast<int64_t>(FunctionAddress) -
+                                  static_cast<int64_t>(FieldAddress);
+            for (uint8_t Byte = 0; Byte < 4; ++Byte)
+              Content[FieldOffset + Byte] = static_cast<WasmEdge::Byte>(
+                  static_cast<uint32_t>(Delta) >> (Byte * 8));
+          }
+        }));
   }
   ASSERT_TRUE(applyRelocations(Graph));
   std::vector<WasmEdge::Byte> Bytes;
@@ -1487,19 +1504,600 @@ LinkGraph makeMachOGraph(Target Architecture) {
   return Graph;
 }
 
+LinkGraph makeMachOCompactGraph(Target Architecture, size_t FunctionCount) {
+  LinkGraph Graph(Architecture, Endianness::Little, ObjectFormat::MachO);
+  EXPECT_TRUE(Graph.beginInput("compact-writer.o"));
+  const uint64_t TextSize = std::max<size_t>(FunctionCount, 1) * 16;
+  auto Text = Graph.addSection(
+      Section{"__text", SectionKind::Text, 16, TextSize, 0, 0,
+              std::vector<WasmEdge::Byte>(static_cast<size_t>(TextSize)),
+              SectionPurpose::Default, 0x1000});
+  auto EH = Graph.addSection(Section{"__eh_frame", SectionKind::Unwind, 8, 32,
+                                     0, 0, std::vector<WasmEdge::Byte>(32),
+                                     SectionPurpose::EHFrame});
+  auto LSDA =
+      Graph.addSection(Section{"__gcc_except_tab", SectionKind::ReadOnly, 4, 4,
+                               0, 0, std::vector<WasmEdge::Byte>(4)});
+  EXPECT_TRUE(Text && EH && LSDA);
+  for (size_t I = 0; I < FunctionCount; ++I) {
+    auto Function = Graph.addSymbol(
+        Symbol{"_f" + std::to_string(I), *Text, I * 16, 16, false, {}, true});
+    EXPECT_TRUE(Function);
+  }
+  return Graph;
+}
+
+const Section *findGraphSection(const LinkGraph &Graph,
+                                SectionPurpose Purpose) {
+  const auto Result = std::find_if(
+      Graph.sections().begin(), Graph.sections().end(),
+      [&](const auto &Section) { return Section.Purpose == Purpose; });
+  return Result == Graph.sections().end() ? nullptr : &*Result;
+}
+
+TEST(MachOWriterTest, BuildsCompressedUnwindInfoAndWritesFinalSection) {
+  constexpr size_t FunctionCount = 1022;
+  auto Graph = makeMachOCompactGraph(Target::AArch64, FunctionCount);
+  auto LSDA = Graph.addSymbol(Symbol{"lsda", 2, 0, 4, false});
+  ASSERT_TRUE(LSDA);
+  for (size_t I = 0; I < FunctionCount; ++I) {
+    const uint32_t Encoding =
+        I % 2 == 0 ? UINT32_C(0x02001000) : UINT32_C(0x04000001);
+    ASSERT_TRUE(Graph.addCompactUnwind(CompactUnwindRecord{
+        static_cast<SymbolId>(I),
+        16,
+        I == 7 ? Encoding | UINT32_C(0x40000000) : Encoding,
+        {},
+        I == 7 ? std::optional<SymbolId>{*LSDA} : std::optional<SymbolId>{},
+        {}}));
+  }
+  auto Size = machOUnwindInfoSize(Graph);
+  ASSERT_TRUE(Size);
+  EXPECT_EQ((*Size - 28 - 3 * 4 - 3 * 12 - 8) % 4096, 0U);
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  ASSERT_TRUE(populateMachOUnwindInfo(Graph));
+  const auto *Unwind = findGraphSection(Graph, SectionPurpose::UnwindInfo);
+  ASSERT_NE(Unwind, nullptr);
+  const auto &Content = Unwind->Content;
+  ASSERT_EQ(Content.size(), *Size);
+  EXPECT_EQ(readInteger(Content, 0, 4, Endianness::Little), 1U);
+  EXPECT_EQ(readInteger(Content, 4, 4, Endianness::Little), 28U);
+  EXPECT_EQ(readInteger(Content, 8, 4, Endianness::Little), 3U);
+  EXPECT_EQ(readInteger(Content, 16, 4, Endianness::Little), 0U);
+  EXPECT_EQ(readInteger(Content, 24, 4, Endianness::Little), 3U);
+  const size_t Index = readInteger(Content, 20, 4, Endianness::Little);
+  const size_t FirstPage =
+      readInteger(Content, Index + 4, 4, Endianness::Little);
+  const size_t SecondPage =
+      readInteger(Content, Index + 16, 4, Endianness::Little);
+  EXPECT_EQ(readInteger(Content, FirstPage, 4, Endianness::Little), 3U);
+  EXPECT_EQ(readInteger(Content, SecondPage, 4, Endianness::Little), 2U);
+  EXPECT_EQ(SecondPage - FirstPage, 4096U);
+  const size_t LSDAIndex =
+      readInteger(Content, Index + 8, 4, Endianness::Little);
+  EXPECT_EQ(readInteger(Content, LSDAIndex, 4, Endianness::Little),
+            Graph.sections()[0].Address + 7 * 16);
+  EXPECT_EQ(readInteger(Content, LSDAIndex + 4, 4, Endianness::Little),
+            Graph.sections()[2].Address);
+
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(MachOWriter::write(Graph, Output));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "compact.dylib"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  llvm::object::SectionRef Storage;
+  EXPECT_NE(findSection(**Object, "__unwind_info", Storage), nullptr);
+  EXPECT_EQ(findSection(**Object, "__compact_unwind", Storage), nullptr);
+}
+
+TEST(MachOWriterTest, SelectsRegularPagesAndPreservesNonMergeableRecords) {
+  constexpr size_t FunctionCount = 300;
+  auto Graph = makeMachOCompactGraph(Target::X86_64, FunctionCount);
+  for (size_t I = 0; I < FunctionCount; ++I) {
+    const uint32_t First = static_cast<uint32_t>(I % 5 + 1);
+    uint32_t Second = static_cast<uint32_t>((I / 5) % 4 + 1);
+    if (Second >= First)
+      ++Second;
+    ASSERT_TRUE(Graph.addCompactUnwind(CompactUnwindRecord{
+        static_cast<SymbolId>(I),
+        16,
+        UINT32_C(0x01000000) | (static_cast<uint32_t>(I / 20 + 1) << 16) |
+            First | (Second << 3),
+        {},
+        {},
+        {}}));
+  }
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  ASSERT_TRUE(populateMachOUnwindInfo(Graph));
+  const auto *Unwind = findGraphSection(Graph, SectionPurpose::UnwindInfo);
+  ASSERT_NE(Unwind, nullptr);
+  const size_t Index = readInteger(Unwind->Content, 20, 4, Endianness::Little);
+  const size_t Page =
+      readInteger(Unwind->Content, Index + 4, 4, Endianness::Little);
+  EXPECT_EQ(readInteger(Unwind->Content, Page, 4, Endianness::Little), 2U);
+  EXPECT_EQ(readInteger(Unwind->Content, Page + 6, 2, Endianness::Little),
+            FunctionCount);
+}
+
+TEST(MachOWriterTest, EncodesDwarfFallbackFromEHFrameBase) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  auto FDE = Graph.addSymbol(Symbol{"fde", 1, 12, 0, false});
+  ASSERT_TRUE(FDE);
+  ASSERT_TRUE(Graph.addEHFrameReference(EHFrameReference{1, 20, 0}));
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x03000000, {}, {}, *FDE}));
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  ASSERT_TRUE(populateMachOUnwindInfo(Graph));
+  const auto *Unwind = findGraphSection(Graph, SectionPurpose::UnwindInfo);
+  ASSERT_NE(Unwind, nullptr);
+  const size_t Index = readInteger(Unwind->Content, 20, 4, Endianness::Little);
+  const size_t Page =
+      readInteger(Unwind->Content, Index + 4, 4, Endianness::Little);
+  ASSERT_EQ(readInteger(Unwind->Content, Page, 4, Endianness::Little), 2U);
+  EXPECT_EQ(readInteger(Unwind->Content, Page + 12, 4, Endianness::Little),
+            UINT32_C(0x0300000C));
+}
+
+TEST(MachOWriterTest, RejectsInvalidNativeCompactUnwind) {
+  auto Personality = makeMachOCompactGraph(Target::AArch64, 1);
+  auto PersonalitySymbol =
+      Personality.addSymbol(Symbol{"personality", 0, 0, 0, false});
+  ASSERT_TRUE(PersonalitySymbol);
+  ASSERT_TRUE(Personality.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, *PersonalitySymbol, {}, {}}));
+  EXPECT_FALSE(machOUnwindInfoSize(Personality));
+
+  auto TooManyPersonalities = makeMachOCompactGraph(Target::AArch64, 4);
+  for (size_t I = 0; I < 4; ++I) {
+    auto PersonalityValue = TooManyPersonalities.addSymbol(
+        Symbol{"personality" + std::to_string(I), 0, I * 16, 0, false});
+    ASSERT_TRUE(PersonalityValue);
+    ASSERT_TRUE(TooManyPersonalities.addCompactUnwind(CompactUnwindRecord{
+        static_cast<SymbolId>(I), 16, 0x02000000, *PersonalityValue, {}, {}}));
+  }
+  EXPECT_FALSE(machOUnwindInfoSize(TooManyPersonalities));
+
+  auto MissingLSDA = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(MissingLSDA.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x42000000, {}, {}, {}}));
+  EXPECT_FALSE(machOUnwindInfoSize(MissingLSDA));
+
+  auto UnexpectedLSDA = makeMachOCompactGraph(Target::AArch64, 1);
+  auto UnexpectedLSDASymbol =
+      UnexpectedLSDA.addSymbol(Symbol{"lsda", 2, 0, 4, false});
+  ASSERT_TRUE(UnexpectedLSDASymbol);
+  ASSERT_TRUE(UnexpectedLSDA.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, *UnexpectedLSDASymbol, {}}));
+  EXPECT_FALSE(machOUnwindInfoSize(UnexpectedLSDA));
+
+  auto MissingFDE = makeMachOCompactGraph(Target::AArch64, 1);
+  auto FDE = MissingFDE.addSymbol(Symbol{"fde", 1, 0, 0, false});
+  ASSERT_TRUE(FDE);
+  ASSERT_TRUE(MissingFDE.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x03000000, {}, {}, *FDE}));
+  EXPECT_FALSE(machOUnwindInfoSize(MissingFDE));
+
+  auto DwarfLSDA = makeMachOCompactGraph(Target::AArch64, 1);
+  auto DwarfFDE = DwarfLSDA.addSymbol(Symbol{"fde", 1, 12, 0, false});
+  auto DwarfLSDASymbol = DwarfLSDA.addSymbol(Symbol{"lsda", 2, 0, 4, false});
+  ASSERT_TRUE(DwarfFDE && DwarfLSDASymbol);
+  ASSERT_TRUE(DwarfLSDA.addEHFrameReference(EHFrameReference{1, 20, 0}));
+  ASSERT_TRUE(DwarfLSDA.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x03000000, {}, *DwarfLSDASymbol, *DwarfFDE}));
+  EXPECT_FALSE(machOUnwindInfoSize(DwarfLSDA));
+
+  auto MultipleEH = makeMachOCompactGraph(Target::AArch64, 1);
+  auto MultipleFDE = MultipleEH.addSymbol(Symbol{"fde", 1, 12, 0, false});
+  ASSERT_TRUE(MultipleFDE);
+  ASSERT_TRUE(MultipleEH.addEHFrameReference(EHFrameReference{1, 20, 0}));
+  ASSERT_TRUE(MultipleEH.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x03000000, {}, {}, *MultipleFDE}));
+  ASSERT_TRUE(MultipleEH.addSection(
+      Section{"__eh_frame", SectionKind::Unwind, 8, 4, 0, 0,
+              std::vector<WasmEdge::Byte>(4), SectionPurpose::EHFrame}));
+  EXPECT_FALSE(machOUnwindInfoSize(MultipleEH));
+
+  for (const auto Purpose :
+       {SectionPurpose::UnwindInfo, SectionPurpose::CompactUnwind}) {
+    auto Existing = makeMachOCompactGraph(Target::AArch64, 1);
+    ASSERT_TRUE(Existing.addCompactUnwind(
+        CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+    ASSERT_TRUE(Existing.addSection(
+        Section{Purpose == SectionPurpose::UnwindInfo ? "__unwind_info"
+                                                      : "__compact_unwind",
+                SectionKind::Unwind, 4, 4, 0, 0, std::vector<WasmEdge::Byte>(4),
+                Purpose}));
+    EXPECT_FALSE(reserveMachOUnwindInfo(Existing));
+  }
+
+  auto Overflow = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(Overflow.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  ASSERT_TRUE(reserveMachOUnwindInfo(Overflow));
+  ASSERT_TRUE(MachOWriter::layout(Overflow));
+  ASSERT_TRUE(Overflow.setSectionAddress(0, UINT64_C(1) << 32));
+  ASSERT_TRUE(applyRelocations(Overflow));
+  EXPECT_FALSE(populateMachOUnwindInfo(Overflow));
+
+  auto LSDAOverflow = makeMachOCompactGraph(Target::AArch64, 1);
+  auto LSDA = LSDAOverflow.addSymbol(Symbol{"lsda", 2, 0, 4, false});
+  ASSERT_TRUE(LSDA);
+  ASSERT_TRUE(LSDAOverflow.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x42000000, {}, *LSDA, {}}));
+  ASSERT_TRUE(reserveMachOUnwindInfo(LSDAOverflow));
+  ASSERT_TRUE(MachOWriter::layout(LSDAOverflow));
+  ASSERT_TRUE(LSDAOverflow.setSectionAddress(2, UINT64_C(1) << 32));
+  ASSERT_TRUE(applyRelocations(LSDAOverflow));
+  EXPECT_FALSE(populateMachOUnwindInfo(LSDAOverflow));
+
+  auto Malformed = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(Malformed.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  auto &Record =
+      const_cast<CompactUnwindRecord &>(Malformed.compactUnwind()[0]);
+  Record.Encoding = 0x0F000000;
+  EXPECT_FALSE(machOUnwindInfoSize(Malformed));
+
+  for (const uint32_t Encoding : {UINT32_C(0x01000006), UINT32_C(0x01000009),
+                                  UINT32_C(0x02000000), UINT32_C(0x03000000)}) {
+    auto InvalidX86 = makeMachOCompactGraph(Target::X86_64, 1);
+    ASSERT_TRUE(InvalidX86.addCompactUnwind(
+        CompactUnwindRecord{0, 16, Encoding, {}, {}, {}}));
+    EXPECT_FALSE(machOUnwindInfoSize(InvalidX86)) << Encoding;
+  }
+  for (const uint32_t Encoding : {UINT32_C(0x02000020), UINT32_C(0x02000040),
+                                  UINT32_C(0x04000020), UINT32_C(0x04001000)}) {
+    auto InvalidARM = makeMachOCompactGraph(Target::AArch64, 1);
+    ASSERT_TRUE(InvalidARM.addCompactUnwind(
+        CompactUnwindRecord{0, 16, Encoding, {}, {}, {}}));
+    EXPECT_FALSE(machOUnwindInfoSize(InvalidARM)) << Encoding;
+  }
+  auto ValidHoles = makeMachOCompactGraph(Target::X86_64, 1);
+  ASSERT_TRUE(ValidHoles.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x01040081, {}, {}, {}}));
+  EXPECT_TRUE(machOUnwindInfoSize(ValidHoles));
+}
+
+TEST(MachOWriterTest, RejectsArm64eCompactModeForGenericAArch64) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x05000000, {}, {}, {}}));
+  EXPECT_FALSE(machOUnwindInfoSize(Graph));
+}
+
+TEST(MachOWriterTest, ChecksUnwindInfoCountSizingAndOffsetBoundaries) {
+  auto Empty = Internal::machOUnwindInfoSizeForCounts(0, 0, 0);
+  auto OnePage = Internal::machOUnwindInfoSizeForCounts(0, 1, 0);
+  ASSERT_TRUE(Empty && OnePage);
+  EXPECT_EQ(*Empty, 40U);
+  EXPECT_EQ(*OnePage, 4148U);
+
+  constexpr uint64_t BaseSize = 40;
+  constexpr uint64_t PageGrowth = 4096 + 12;
+  constexpr uint64_t LastPageCount = (UINT32_MAX - BaseSize) / PageGrowth;
+  auto Boundary = Internal::machOUnwindInfoSizeForCounts(0, LastPageCount, 0);
+  ASSERT_TRUE(Boundary);
+  EXPECT_LE(*Boundary, UINT32_MAX);
+  EXPECT_FALSE(Internal::machOUnwindInfoSizeForCounts(0, LastPageCount + 1, 0));
+  EXPECT_FALSE(Internal::machOUnwindInfoSizeForCounts(UINT64_MAX, 0, 0));
+  EXPECT_FALSE(Internal::machOUnwindInfoSizeForCounts(0, UINT64_MAX, 0));
+  EXPECT_FALSE(Internal::machOUnwindInfoSizeForCounts(0, 0, UINT64_MAX));
+}
+
+TEST(MachOWriterTest, PrunesUnreferencedEHFrameFromCompactOutput) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  auto LSDA = Graph.addSymbol(Symbol{"lsda", 2, 0, 4, false});
+  ASSERT_TRUE(LSDA);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x42000000, {}, *LSDA, {}}));
+  ASSERT_TRUE(Graph.pruneUnreferencedMachOEHFrame());
+  EXPECT_EQ(findGraphSection(Graph, SectionPurpose::EHFrame), nullptr);
+  ASSERT_TRUE(Graph.validate());
+  ASSERT_TRUE(Graph.compactUnwind()[0].LSDA);
+  EXPECT_EQ(Graph.symbols()[*Graph.compactUnwind()[0].LSDA].Section, 1U);
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(normalizeMachOEHFrame(Graph));
+  ASSERT_TRUE(validateMachOEHFrameCoverage(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  ASSERT_TRUE(populateMachOUnwindInfo(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(MachOWriter::write(Graph, Output));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "compact-no-eh.dylib"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  llvm::object::SectionRef Storage;
+  EXPECT_EQ(findSection(**Object, "__eh_frame", Storage), nullptr);
+  EXPECT_NE(findSection(**Object, "__unwind_info", Storage), nullptr);
+}
+
+TEST(MachOWriterTest, RetainsIndependentDwarfCoverageWithCompactRecords) {
+  LinkGraph Source(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Source.beginInput("dwarf-source.o"));
+  auto SourceText = Source.addSection(Section{
+      "__text", SectionKind::Text, 4, 16, 0, 0, std::vector<WasmEdge::Byte>(16),
+      SectionPurpose::Default, 0x1000});
+  ASSERT_TRUE(SourceText);
+  auto SourceFunction =
+      Source.addSymbol(Symbol{"_f1", *SourceText, 0, 16, true, {}, true});
+  ASSERT_TRUE(SourceFunction);
+  ASSERT_TRUE(Source.addCompactUnwind(
+      CompactUnwindRecord{*SourceFunction, 16, 0x02000000, {}, {}, {}}));
+  ASSERT_TRUE(compactUnwindToEHFrame(Source));
+  const auto SourceEH =
+      std::find_if(Source.sections().begin(), Source.sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::EHFrame;
+                   });
+  ASSERT_NE(SourceEH, Source.sections().end());
+  ASSERT_EQ(Source.ehFrameReferences().size(), 1U);
+
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("mixed-coverage.o"));
+  auto Text = Graph.addSection(Section{"__text", SectionKind::Text, 4, 32, 0, 0,
+                                       std::vector<WasmEdge::Byte>(32),
+                                       SectionPurpose::Default, 0x1000});
+  auto EH = Graph.addSection(*SourceEH);
+  ASSERT_TRUE(Text && EH);
+  auto Compact = Graph.addSymbol(Symbol{"_f0", *Text, 0, 16, true, {}, true});
+  auto Dwarf = Graph.addSymbol(Symbol{"_f1", *Text, 16, 16, true, {}, true});
+  ASSERT_TRUE(Compact && Dwarf);
+  ASSERT_TRUE(Graph.addEHFrameReference(
+      EHFrameReference{*EH, Source.ehFrameReferences()[0].Offset, *Dwarf}));
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{*Compact, 16, 0x02000000, {}, {}, {}}));
+
+  ASSERT_TRUE(Graph.pruneUnreferencedMachOEHFrame());
+  EXPECT_NE(findGraphSection(Graph, SectionPurpose::EHFrame), nullptr);
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(normalizeMachOEHFrame(Graph));
+  ASSERT_TRUE(validateMachOEHFrameCoverage(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  ASSERT_TRUE(populateMachOUnwindInfo(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(MachOWriter::write(Graph, Output));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "mixed-coverage.dylib"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  llvm::object::SectionRef Storage;
+  EXPECT_NE(findSection(**Object, "__eh_frame", Storage), nullptr);
+  EXPECT_NE(findSection(**Object, "__unwind_info", Storage), nullptr);
+}
+
+TEST(MachOWriterTest, RetainsEHFrameForCompactDwarfFallback) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  auto FDE = Graph.addSymbol(Symbol{"fde", 1, 12, 0, false});
+  ASSERT_TRUE(FDE);
+  ASSERT_TRUE(Graph.addEHFrameReference(EHFrameReference{1, 20, 0}));
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x03000000, {}, {}, *FDE}));
+  const auto Sections = Graph.sections().size();
+  ASSERT_TRUE(Graph.pruneUnreferencedMachOEHFrame());
+  EXPECT_EQ(Graph.sections().size(), Sections);
+  EXPECT_NE(findGraphSection(Graph, SectionPurpose::EHFrame), nullptr);
+}
+
+TEST(MachOWriterTest, LeavesEHOnlyGraphUnchangedWhenPruning) {
+  auto Graph = makeMachOGraph(Target::X86_64);
+  const auto Sections = Graph.sections();
+  const auto Symbols = Graph.symbols();
+  ASSERT_TRUE(Graph.pruneUnreferencedMachOEHFrame());
+  ASSERT_EQ(Graph.sections().size(), Sections.size());
+  ASSERT_EQ(Graph.symbols().size(), Symbols.size());
+  for (size_t I = 0; I < Sections.size(); ++I) {
+    EXPECT_EQ(Graph.sections()[I].Name, Sections[I].Name);
+    EXPECT_EQ(Graph.sections()[I].Purpose, Sections[I].Purpose);
+  }
+}
+
+TEST(MachOWriterTest, RejectsUnfinalizedCompactUnwindGraphs) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  EXPECT_FALSE(MachOWriter::layout(Graph));
+
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  EXPECT_EQ(Graph.machOUnwindInfoState(), MachOUnwindInfoState::Reserved);
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  auto Unwind =
+      std::find_if(Graph.sections().begin(), Graph.sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::UnwindInfo;
+                   });
+  ASSERT_NE(Unwind, Graph.sections().end());
+  const std::array<WasmEdge::Byte, 1> Content{1};
+  ASSERT_TRUE(Graph.writeSectionContent(
+      static_cast<SectionId>(Unwind - Graph.sections().begin()), 0, Content));
+  EXPECT_EQ(Graph.machOUnwindInfoState(), MachOUnwindInfoState::Reserved);
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_FALSE(MachOWriter::write(Graph, Output));
+  EXPECT_TRUE(Bytes.empty());
+}
+
+TEST(MachOWriterTest, TracksPopulatedUnwindInfoExplicitly) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  EXPECT_EQ(Graph.machOUnwindInfoState(), MachOUnwindInfoState::None);
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  EXPECT_EQ(Graph.machOUnwindInfoState(), MachOUnwindInfoState::Reserved);
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  ASSERT_TRUE(populateMachOUnwindInfo(Graph));
+  EXPECT_EQ(Graph.machOUnwindInfoState(), MachOUnwindInfoState::Populated);
+  const auto Unwind =
+      std::find_if(Graph.sections().begin(), Graph.sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::UnwindInfo;
+                   });
+  ASSERT_NE(Unwind, Graph.sections().end());
+  const auto UnwindId =
+      static_cast<SectionId>(Unwind - Graph.sections().begin());
+  const auto Content = Unwind->Content;
+  EXPECT_TRUE(Graph.sectionContent(UnwindId));
+  const std::array<WasmEdge::Byte, 1> Patch{1};
+  EXPECT_FALSE(Graph.writeSectionContent(UnwindId, 0, Patch));
+  EXPECT_EQ(Graph.sections()[UnwindId].Content, Content);
+  EXPECT_EQ(Graph.machOUnwindInfoState(), MachOUnwindInfoState::Populated);
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_TRUE(MachOWriter::write(Graph, Output));
+}
+
+TEST(MachOWriterTest, RejectsGraphMutationAfterUnwindInfoPopulation) {
+  const auto MakePopulated = [] {
+    auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+    EXPECT_TRUE(Graph.addCompactUnwind(
+        CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+    EXPECT_TRUE(reserveMachOUnwindInfo(Graph));
+    EXPECT_TRUE(MachOWriter::layout(Graph));
+    EXPECT_TRUE(applyRelocations(Graph));
+    EXPECT_TRUE(populateMachOUnwindInfo(Graph));
+    return Graph;
+  };
+
+  auto SectionGraph = MakePopulated();
+  EXPECT_FALSE(SectionGraph.addSection(
+      Section{"__late", SectionKind::Data, 1, 1, 0, 0, {0}}));
+  auto SymbolGraph = MakePopulated();
+  EXPECT_FALSE(SymbolGraph.addSymbol(Symbol{"late", 0, 0, 0, false}));
+  auto CompactGraph = MakePopulated();
+  EXPECT_FALSE(CompactGraph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  auto RelocationGraph = MakePopulated();
+  EXPECT_FALSE(RelocationGraph.addRelocation(
+      Relocation{0, 0, llvm::MachO::ARM64_RELOC_UNSIGNED, 0, 0, false,
+                 ObjectFormat::MachO, 8, false, true, false}));
+  auto RebaseGraph = MakePopulated();
+  EXPECT_FALSE(RebaseGraph.addRebase(Rebase{
+      0, 0, llvm::MachO::ARM64_RELOC_UNSIGNED, 0, 8, ObjectFormat::MachO}));
+  auto EHReferenceGraph = MakePopulated();
+  EXPECT_FALSE(EHReferenceGraph.addEHFrameReference(EHFrameReference{1, 0, 0}));
+  auto AddressGraph = MakePopulated();
+  EXPECT_FALSE(AddressGraph.setSectionAddress(0, 4096));
+  auto FileOffsetGraph = MakePopulated();
+  EXPECT_FALSE(FileOffsetGraph.setSectionFileOffset(0, 4096));
+  auto LinkedGraph = MakePopulated();
+  EXPECT_FALSE(LinkedGraph.setLinkedSection(0, 1));
+  auto PruneGraph = MakePopulated();
+  EXPECT_FALSE(PruneGraph.pruneUnreferencedMachOEHFrame());
+
+  auto RelocatedGraph = MakePopulated();
+  EXPECT_FALSE(applyRelocations(RelocatedGraph));
+}
+
+TEST(MachOWriterTest, RejectsEHFrameConversionAfterUnwindInfoPopulation) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  ASSERT_TRUE(populateMachOUnwindInfo(Graph));
+  const auto Sections = Graph.sections();
+  const auto References = Graph.ehFrameReferences();
+  const auto State = Graph.machOUnwindInfoState();
+
+  EXPECT_FALSE(compactUnwindToEHFrame(Graph));
+  ASSERT_EQ(Graph.sections().size(), Sections.size());
+  for (size_t I = 0; I < Sections.size(); ++I) {
+    EXPECT_EQ(Graph.sections()[I].Name, Sections[I].Name);
+    EXPECT_EQ(Graph.sections()[I].Content, Sections[I].Content);
+  }
+  EXPECT_EQ(Graph.ehFrameReferences().size(), References.size());
+  EXPECT_EQ(Graph.machOUnwindInfoState(), State);
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_TRUE(MachOWriter::write(Graph, Output));
+}
+
+TEST(MachOWriterTest, FailedPopulationRemainsReserved) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+  ASSERT_TRUE(MachOWriter::layout(Graph));
+  ASSERT_TRUE(Graph.setSectionAddress(0, UINT64_C(1) << 32));
+  ASSERT_TRUE(applyRelocations(Graph));
+  EXPECT_FALSE(populateMachOUnwindInfo(Graph));
+  EXPECT_EQ(Graph.machOUnwindInfoState(), MachOUnwindInfoState::Reserved);
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  EXPECT_FALSE(MachOWriter::write(Graph, Output));
+  EXPECT_TRUE(Bytes.empty());
+}
+
+TEST(MachOWriterTest, ManualUnwindInfoSectionIsNotFinalized) {
+  auto Graph = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  ASSERT_TRUE(Graph.addSection(
+      Section{"__unwind_info", SectionKind::Unwind, 4, 28, 0, 0,
+              std::vector<WasmEdge::Byte>(28), SectionPurpose::UnwindInfo}));
+  const std::array<WasmEdge::Byte, 1> Content{1};
+  ASSERT_TRUE(Graph.writeSectionContent(3, 0, Content));
+  EXPECT_EQ(Graph.machOUnwindInfoState(), MachOUnwindInfoState::None);
+  EXPECT_FALSE(Graph.validate());
+  EXPECT_FALSE(MachOWriter::layout(Graph));
+}
+
+TEST(MachOWriterTest, RejectsCompactSymbolAddressOverflow) {
+  auto FunctionOverflow = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(FunctionOverflow.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  ASSERT_TRUE(reserveMachOUnwindInfo(FunctionOverflow));
+  ASSERT_TRUE(MachOWriter::layout(FunctionOverflow));
+  ASSERT_TRUE(FunctionOverflow.setSectionAddress(0, UINT64_MAX - 7));
+  auto &OverflowSymbol =
+      const_cast<Symbol &>(FunctionOverflow.symbols().front());
+  OverflowSymbol.Offset = 8;
+  EXPECT_FALSE(applyRelocations(FunctionOverflow));
+
+  auto RangeOverflow = makeMachOCompactGraph(Target::AArch64, 1);
+  ASSERT_TRUE(RangeOverflow.addCompactUnwind(
+      CompactUnwindRecord{0, 16, 0x02000000, {}, {}, {}}));
+  ASSERT_TRUE(reserveMachOUnwindInfo(RangeOverflow));
+  ASSERT_TRUE(MachOWriter::layout(RangeOverflow));
+  ASSERT_TRUE(RangeOverflow.setSectionAddress(0, UINT64_MAX - 15));
+  ASSERT_TRUE(applyRelocations(RangeOverflow));
+  EXPECT_FALSE(populateMachOUnwindInfo(RangeOverflow));
+}
+
 TEST(MachOWriterTest, WritesDeterministicDylibsForMacOSTargets) {
   for (const auto Architecture : {Target::X86_64, Target::AArch64}) {
     auto Graph = makeMachOGraph(Architecture);
     ASSERT_TRUE(MachOWriter::layout(Graph));
-    auto Data = Graph.sectionContent(3);
-    auto Pointer = Graph.sectionContent(4);
-    ASSERT_TRUE(Data && Pointer);
-    for (uint8_t I = 0; I < 8; ++I)
-      (*Data)[I] =
-          static_cast<WasmEdge::Byte>(Graph.sections()[3].Address >> (I * 8));
-    for (uint8_t I = 0; I < 8; ++I)
-      (*Pointer)[I] =
-          static_cast<WasmEdge::Byte>(Graph.sections()[4].Address >> (I * 8));
+    ASSERT_TRUE(mutateSectionContent(Graph, 3, [&](auto &Data) {
+      for (uint8_t I = 0; I < 8; ++I)
+        Data[I] =
+            static_cast<WasmEdge::Byte>(Graph.sections()[3].Address >> (I * 8));
+    }));
+    ASSERT_TRUE(mutateSectionContent(Graph, 4, [&](auto &Pointer) {
+      for (uint8_t I = 0; I < 8; ++I)
+        Pointer[I] =
+            static_cast<WasmEdge::Byte>(Graph.sections()[4].Address >> (I * 8));
+    }));
     ASSERT_TRUE(applyRelocations(Graph));
     std::vector<WasmEdge::Byte> Bytes;
     Writer Output(Bytes);

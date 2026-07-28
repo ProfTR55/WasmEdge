@@ -5,6 +5,7 @@
 
 #include "common/configure.h"
 #include "common/defines.h"
+#include "linker/compact_unwind.h"
 #include "linker/eh_frame.h"
 #include "linker/elf_writer.h"
 #include "linker/layout.h"
@@ -266,11 +267,23 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
     if (Kind == OutputKind::ELF && !ELFWriter::layout(Graph)) {
       return linkError();
     }
-    if (Kind == OutputKind::MachO && !MachOWriter::layout(Graph)) {
-      return linkError();
+    if (Kind == OutputKind::MachO) {
+      if (!Graph.compactUnwind().empty()) {
+        auto Pruned = Graph.pruneUnreferencedMachOEHFrame();
+        if (!Pruned)
+          return linkError();
+        EXPECTED_TRY(reserveMachOUnwindInfo(Graph));
+      }
+      if (!MachOWriter::layout(Graph)) {
+        return linkError();
+      }
     }
     if (Kind == OutputKind::PE && !PEWriter::layout(Graph)) {
       return linkError();
+    }
+    if (Kind == OutputKind::UniversalWasm &&
+        Graph.format() == ObjectFormat::MachO) {
+      EXPECTED_TRY(compactUnwindToEHFrame(Graph));
     }
     if (Kind != OutputKind::ELF && Kind != OutputKind::MachO &&
         Kind != OutputKind::PE && !layout(Graph, 0, HostPageSize)) {
@@ -281,6 +294,9 @@ Expect<void> NativeLinker::link(Span<const Byte> Object, Span<const Byte> Wasm,
       EXPECTED_TRY(validateMachOEHFrameCoverage(Graph));
     }
     EXPECTED_TRY(applyRelocations(Graph));
+    if (Kind == OutputKind::MachO && !Graph.compactUnwind().empty()) {
+      EXPECTED_TRY(populateMachOUnwindInfo(Graph));
+    }
 
     EXPECTED_TRY(auto Temp, createUniqueSibling(Output));
     TempGuard Guard(std::move(Temp.Path), Temp.File);

@@ -162,7 +162,7 @@ bool requiredSemanticFunction(const LinkGraph &Graph,
          std::to_string(Index) == Name.substr(1);
 }
 
-Expect<ParsedFrame> parse(Span<const Byte> Bytes) {
+Expect<ParsedFrame> parse(Span<const Byte> Bytes, Target Architecture) {
   ParsedFrame Result;
   std::map<size_t, uint8_t> CIEs;
   size_t Offset = 0;
@@ -201,7 +201,9 @@ Expect<ParsedFrame> parse(Span<const Byte> Bytes) {
         return Unexpect(ErrCode::Value::IllegalPath);
       uint64_t Unsigned = 0;
       int64_t Signed = 0;
-      if (!readULEB(Bytes.subspan(0, End), Cursor, Unsigned) || Unsigned != 1 ||
+      if (!readULEB(Bytes.subspan(0, End), Cursor, Unsigned) ||
+          (Unsigned != 1 &&
+           (Architecture != Target::AArch64 || Unsigned != 4)) ||
           !readSLEB(Bytes.subspan(0, End), Cursor, Signed) || Signed >= 0 ||
           !readULEB(Bytes.subspan(0, End), Cursor, Unsigned) ||
           !readULEB(Bytes.subspan(0, End), Cursor, Unsigned) || Unsigned != 1 ||
@@ -255,6 +257,12 @@ Expect<uint64_t> resolveMachOFDEAddress(uint64_t LoadBase,
 
 } // namespace Internal
 
+Expect<std::set<size_t>> machOEHFrameFields(Span<const Byte> Bytes,
+                                           Target Architecture) {
+  EXPECTED_TRY(auto Parsed, parse(Bytes, Architecture));
+  return Parsed.FDEFields;
+}
+
 Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
   if (Graph.format() != ObjectFormat::MachO)
     return {};
@@ -264,17 +272,36 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
   Content.reserve(Sections.size());
   for (const auto &Section : Sections)
     Content.push_back(Section.Content);
+  std::vector<std::set<size_t>> Fields(Sections.size());
+  for (size_t I = 0; I < Sections.size(); ++I) {
+    if (Sections[I].Purpose != SectionPurpose::EHFrame)
+      continue;
+    EXPECTED_TRY(auto Parsed, parse(Content[I], Graph.target()));
+    Fields[I] = std::move(Parsed.FDEFields);
+  }
+  std::set<std::pair<SectionId, uint64_t>> ReferenceFields;
+  for (const auto &Reference : Graph.ehFrameReferences()) {
+    if (Reference.Section >= Sections.size() ||
+        Sections[Reference.Section].Purpose != SectionPurpose::EHFrame ||
+        Reference.Symbol >= Graph.symbols().size() ||
+        Graph.symbols()[Reference.Symbol].Section >= Sections.size() ||
+        Fields[Reference.Section].count(static_cast<size_t>(Reference.Offset)) ==
+            0 ||
+        !ReferenceFields.emplace(Reference.Section, Reference.Offset).second)
+      return fail();
+  }
   std::vector<uint8_t> Remove(Relocations.size());
   bool HasEHFrame = false;
   for (size_t I = 0; I < Sections.size(); ++I) {
     if (Sections[I].Purpose != SectionPurpose::EHFrame)
       continue;
     HasEHFrame = true;
-    EXPECTED_TRY(auto Parsed, parse(Content[I]));
+    EXPECTED_TRY(auto Parsed, parse(Content[I], Graph.target()));
     std::map<size_t, SymbolId> References;
     for (const auto &Reference : Graph.ehFrameReferences()) {
-      if (Reference.Section == I)
-        References.emplace(Reference.Offset, Reference.Symbol);
+      if (Reference.Section != I)
+        continue;
+      References.emplace(Reference.Offset, Reference.Symbol);
     }
     for (const auto Field : Parsed.FDEFields) {
       if (References.count(Field) != 0)
@@ -336,9 +363,9 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
                                  Endianness::Little, Delta))
         return fail();
     }
-    EXPECTED_TRY(parse(Content[I]));
+    EXPECTED_TRY(parse(Content[I], Graph.target()));
   }
-  if (!HasEHFrame)
+  if (!HasEHFrame && Graph.compactUnwind().empty())
     return fail();
   for (size_t I = 0; I < Sections.size(); ++I)
     Sections[I].Content = std::move(Content[I]);
@@ -349,8 +376,32 @@ Expect<void> normalizeMachOEHFrame(LinkGraph &Graph) {
 Expect<void> validateMachOEHFrameCoverage(const LinkGraph &Graph) {
   if (Graph.format() != ObjectFormat::MachO)
     return {};
-  EXPECTED_TRY(auto Starts, machOEHFrameStarts(Graph, 0));
-  const std::set<uint64_t> FDEAddresses(Starts.begin(), Starts.end());
+  std::set<uint64_t> CoveredAddresses;
+  const bool HasEHFrame =
+      std::any_of(Graph.sections().begin(), Graph.sections().end(),
+                  [](const auto &Section) {
+                    return Section.Purpose == SectionPurpose::EHFrame;
+                  });
+  if (HasEHFrame) {
+    EXPECTED_TRY(auto Starts, machOEHFrameStarts(Graph, 0));
+    CoveredAddresses.insert(Starts.begin(), Starts.end());
+  }
+  const bool HasUnwindInfo =
+      std::any_of(Graph.sections().begin(), Graph.sections().end(),
+                  [](const auto &Section) {
+                    return Section.Purpose == SectionPurpose::UnwindInfo;
+                  });
+  if (HasUnwindInfo) {
+    for (const auto &Record : Graph.compactUnwind()) {
+      if (Record.Function >= Graph.symbols().size())
+        return fail();
+      const auto &Symbol = Graph.symbols()[Record.Function];
+      if (Symbol.Section >= Graph.sections().size())
+        return fail();
+      CoveredAddresses.insert(Graph.sections()[Symbol.Section].Address +
+                              Symbol.Offset);
+    }
+  }
   std::set<uint64_t> RequiredAddresses;
   for (const auto &Symbol : Graph.symbols()) {
     if (!requiredSemanticFunction(Graph, Symbol))
@@ -363,7 +414,7 @@ Expect<void> validateMachOEHFrameCoverage(const LinkGraph &Graph) {
       return fail();
     RequiredAddresses.insert(Address);
   }
-  if (!std::includes(FDEAddresses.begin(), FDEAddresses.end(),
+  if (!std::includes(CoveredAddresses.begin(), CoveredAddresses.end(),
                      RequiredAddresses.begin(), RequiredAddresses.end()))
     return fail();
   return {};
@@ -375,7 +426,7 @@ Expect<std::vector<uint64_t>> machOEHFrameStarts(const LinkGraph &Graph,
   for (const auto &Section : Graph.sections()) {
     if (Section.Purpose != SectionPurpose::EHFrame)
       continue;
-    EXPECTED_TRY(auto Parsed, parse(Section.Content));
+    EXPECTED_TRY(auto Parsed, parse(Section.Content, Graph.target()));
     for (const auto Field : Parsed.Starts) {
       uint64_t Raw = 0;
       if (!readU64(Section.Content, Field, Raw))

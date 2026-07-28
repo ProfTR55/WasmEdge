@@ -10,6 +10,7 @@
 #pragma warning(pop)
 #endif
 
+#include "linker/compact_unwind.h"
 #include "linker/eh_frame.h"
 #include "linker/elf_writer.h"
 #include "linker/layout.h"
@@ -23,6 +24,7 @@
 #include "linker/writer.h"
 
 #include "aot/version.h"
+#include "common/spdlog.h"
 #include "loader/loader.h"
 #include "loader/shared_library.h"
 #include "validator/validator.h"
@@ -206,7 +208,8 @@ std::vector<WasmEdge::Byte> makeObject(
     bool Representative = false, bool Exceptions = false,
     std::string ModuleAssembly = {}, bool SemanticSymbols = false,
     bool TypeWrapper = false, bool FloatingPoint = false,
-    bool DefineFltused = false, bool UnusedAllocatableSections = false) {
+    bool DefineFltused = false, bool UnusedAllocatableSections = false,
+    bool DistinctTypeWrapperUnwind = false) {
   static const bool Initialized = [] {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
@@ -224,10 +227,6 @@ std::vector<WasmEdge::Byte> makeObject(
     return {};
   }
   llvm::TargetOptions Options;
-#if LLVM_VERSION_MAJOR >= 15
-  if (!ModuleAssembly.empty() && Triple.isOSBinFormatMachO())
-    Options.MCOptions.EmitDwarfUnwind = llvm::EmitDwarfUnwindType::Always;
-#endif
   std::unique_ptr<llvm::TargetMachine> Machine(
       NativeTarget->createTargetMachine(
 #if LLVM_VERSION_MAJOR >= 21
@@ -312,7 +311,13 @@ std::vector<WasmEdge::Byte> makeObject(
 #endif
     llvm::IRBuilder<> WrapperBuilder(
         llvm::BasicBlock::Create(Context, "entry", T0));
-    WrapperBuilder.CreateRet(llvm::ConstantInt::get(I32, 0));
+    if (DistinctTypeWrapperUnwind) {
+      auto *Slot = WrapperBuilder.CreateAlloca(I32);
+      WrapperBuilder.CreateStore(llvm::ConstantInt::get(I32, 0), Slot, true);
+      WrapperBuilder.CreateRet(WrapperBuilder.CreateLoad(I32, Slot, true));
+    } else {
+      WrapperBuilder.CreateRet(llvm::ConstantInt::get(I32, 0));
+    }
   }
   if (UnusedAllocatableSections) {
     auto *UnusedFunction = llvm::Function::Create(
@@ -469,11 +474,341 @@ uint64_t read64le(const std::vector<WasmEdge::Byte> &Bytes, size_t Offset) {
   return Value;
 }
 
+uint32_t read32le(const std::vector<WasmEdge::Byte> &Bytes, size_t Offset) {
+  uint32_t Value = 0;
+  for (size_t I = 0; I < 4; ++I) {
+    Value |= static_cast<uint32_t>(Bytes[Offset + I]) << (I * 8);
+  }
+  return Value;
+}
+
+std::optional<std::vector<uint32_t>>
+machOUnwindFunctionStarts(const std::vector<WasmEdge::Byte> &Content) {
+  if (Content.size() < 28)
+    return std::nullopt;
+  const size_t Index = read32le(Content, 20);
+  const uint32_t IndexCount = read32le(Content, 24);
+  if (IndexCount == 0 || Index > Content.size() ||
+      IndexCount > (Content.size() - Index) / 12)
+    return std::nullopt;
+  std::vector<uint32_t> Result;
+  for (uint32_t I = 0; I + 1 < IndexCount; ++I) {
+    const uint32_t Base = read32le(Content, Index + I * 12);
+    const size_t Page = read32le(Content, Index + I * 12 + 4);
+    if (Page > Content.size() || Content.size() - Page < 8)
+      return std::nullopt;
+    const uint32_t Kind = read32le(Content, Page);
+    uint16_t Entries = 0;
+    uint16_t Count = 0;
+    std::memcpy(&Entries, Content.data() + Page + 4, sizeof(Entries));
+    std::memcpy(&Count, Content.data() + Page + 6, sizeof(Count));
+    const size_t Width = Kind == 2 ? 8 : Kind == 3 ? 4 : 0;
+    if (Width == 0 || Entries > Content.size() - Page ||
+        Count > (Content.size() - Page - Entries) / Width)
+      return std::nullopt;
+    for (uint16_t J = 0; J < Count; ++J) {
+      const uint32_t Entry = read32le(Content, Page + Entries + J * Width);
+      Result.push_back(Kind == 2 ? Entry
+                                 : Base + (Entry & UINT32_C(0x00FFFFFF)));
+    }
+  }
+  return Result;
+}
+
+struct RawCompactUnwindRecord {
+  uint64_t Function;
+  uint32_t Length;
+  uint32_t Encoding;
+  uint64_t Personality;
+  uint64_t LSDA;
+};
+
+static_assert(sizeof(RawCompactUnwindRecord) == 32);
+
+struct RawCompactUnwindRelocation {
+  uint64_t Offset;
+  uint64_t Type;
+  std::string Symbol;
+};
+
+struct RawCompactUnwindInventory {
+  std::vector<RawCompactUnwindRecord> Records;
+  std::vector<RawCompactUnwindRelocation> Relocations;
+  bool HasCompactUnwind = false;
+  bool HasEHFrame = false;
+};
+
+RawCompactUnwindInventory
+collectCompactUnwindInventory(const std::vector<WasmEdge::Byte> &Bytes) {
+  RawCompactUnwindInventory Result;
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "compact-unwind.o"));
+  EXPECT_TRUE(static_cast<bool>(Object));
+  if (!Object) {
+    llvm::consumeError(Object.takeError());
+    return Result;
+  }
+  const auto *MachO = llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Object);
+  EXPECT_NE(MachO, nullptr);
+  if (MachO == nullptr)
+    return Result;
+  for (const auto &Section : MachO->sections()) {
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (!Name)
+      continue;
+    Result.HasEHFrame |= *Name == "__eh_frame";
+    if (*Name != "__compact_unwind")
+      continue;
+    Result.HasCompactUnwind = true;
+    auto Contents = Section.getContents();
+    EXPECT_TRUE(static_cast<bool>(Contents));
+    if (!Contents)
+      continue;
+    const std::vector<WasmEdge::Byte> Content(Contents->bytes_begin(),
+                                              Contents->bytes_end());
+    EXPECT_EQ(Content.size() % sizeof(RawCompactUnwindRecord), 0U);
+    if (Content.size() % sizeof(RawCompactUnwindRecord) != 0)
+      continue;
+    for (size_t Offset = 0; Offset < Content.size();
+         Offset += sizeof(RawCompactUnwindRecord)) {
+      Result.Records.push_back(
+          {read64le(Content, Offset), read32le(Content, Offset + 8),
+           read32le(Content, Offset + 12), read64le(Content, Offset + 16),
+           read64le(Content, Offset + 24)});
+    }
+    for (const auto &Relocation : Section.relocations()) {
+      std::string SymbolName;
+      const auto Symbol = Relocation.getSymbol();
+      if (Symbol != MachO->symbol_end()) {
+        auto RelocationName = Symbol->getName();
+        EXPECT_TRUE(static_cast<bool>(RelocationName));
+        if (RelocationName)
+          SymbolName = RelocationName->str();
+      }
+      Result.Relocations.push_back(
+          {Relocation.getOffset(), Relocation.getType(), SymbolName});
+    }
+  }
+  return Result;
+}
+
 void write64le(std::vector<WasmEdge::Byte> &Bytes, size_t Offset,
                uint64_t Value) {
   for (size_t I = 0; I < 8; ++I) {
     Bytes[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
   }
+}
+
+void write32le(std::vector<WasmEdge::Byte> &Bytes, size_t Offset,
+               uint32_t Value) {
+  for (size_t I = 0; I < 4; ++I) {
+    Bytes[Offset + I] = static_cast<WasmEdge::Byte>(Value >> (I * 8));
+  }
+}
+
+struct MachOEHFrameObject {
+  size_t Content = 0;
+  std::vector<size_t> Relocations;
+};
+
+MachOEHFrameObject
+machOEHFrameObject(const std::vector<WasmEdge::Byte> &Bytes) {
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "eh-frame.o"));
+  EXPECT_TRUE(static_cast<bool>(Object));
+  if (!Object) {
+    llvm::consumeError(Object.takeError());
+    return {};
+  }
+  const auto *MachO = llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Object);
+  EXPECT_NE(MachO, nullptr);
+  if (MachO == nullptr)
+    return {};
+  for (const auto &Section : MachO->sections()) {
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (!Name || *Name != "__eh_frame")
+      continue;
+    auto Contents = Section.getContents();
+    EXPECT_TRUE(static_cast<bool>(Contents));
+    if (!Contents)
+      return {};
+    MachOEHFrameObject Result;
+    Result.Content = static_cast<size_t>(
+        reinterpret_cast<const WasmEdge::Byte *>(Contents->data()) -
+        Bytes.data());
+    const auto Header = MachO->getSection64(Section.getRawDataRefImpl());
+    for (const auto &Relocation : Section.relocations())
+      Result.Relocations.push_back(Header.reloff +
+                                   Relocation.getRawDataRefImpl().d.b * 8);
+    return Result;
+  }
+  ADD_FAILURE() << "generated object has no EH frame section";
+  return {};
+}
+
+std::vector<WasmEdge::Byte> makeAArch64MachOEHFrameObject() {
+  constexpr std::string_view Frame = R"(
+.section __TEXT,__eh_frame,coalesced,no_toc+strip_static_syms+live_support
+.p2align 3
+Lcie:
+.long Lcie_end-Lcie-4
+.long 0
+.byte 1
+.asciz "zR"
+.byte 4
+.byte 0x78
+.byte 30
+.byte 1
+.byte 0x10
+.p2align 3
+Lcie_end:
+Lfde:
+.long Lfde_end-Lfde-4
+.long Lfde+4-Lcie
+.quad _f0-.
+.quad 4
+.byte 0
+.p2align 3
+Lfde_end:
+.long 0
+.text
+)";
+  return makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                    false, false, "generic", {}, false, false, false, false,
+                    false, false, std::string(Frame));
+}
+
+void clearMachOSectionRelocations(std::vector<WasmEdge::Byte> &Bytes,
+                                  std::string_view Name) {
+  constexpr size_t MachHeaderSize = 32;
+  constexpr size_t SegmentCommandSize = 72;
+  constexpr size_t SectionSize = 80;
+  constexpr size_t SectionRelocationCountOffset = 60;
+  const uint32_t CommandCount = read32le(Bytes, 16);
+  size_t CommandOffset = MachHeaderSize;
+  for (uint32_t I = 0; I < CommandCount; ++I) {
+    const uint32_t Command = read32le(Bytes, CommandOffset);
+    const uint32_t CommandSize = read32le(Bytes, CommandOffset + 4);
+    if (Command == llvm::MachO::LC_SEGMENT_64) {
+      const uint32_t SectionCount = read32le(Bytes, CommandOffset + 64);
+      for (uint32_t J = 0; J < SectionCount; ++J) {
+        const size_t SectionOffset =
+            CommandOffset + SegmentCommandSize + J * SectionSize;
+        const std::string_view SectionName(
+            reinterpret_cast<const char *>(Bytes.data() + SectionOffset), 16);
+        if (SectionName.substr(0, SectionName.find('\0')) == Name)
+          write32le(Bytes, SectionOffset + SectionRelocationCountOffset, 0);
+      }
+    }
+    CommandOffset += CommandSize;
+  }
+}
+
+struct CompactUnwindObjectOffsets {
+  size_t Content;
+  uint32_t Count;
+};
+
+CompactUnwindObjectOffsets
+compactUnwindObjectOffsets(const std::vector<WasmEdge::Byte> &Bytes) {
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "compact-unwind.o"));
+  EXPECT_TRUE(static_cast<bool>(Object));
+  if (!Object) {
+    llvm::consumeError(Object.takeError());
+    return {};
+  }
+  const auto *MachO = llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Object);
+  EXPECT_NE(MachO, nullptr);
+  if (MachO == nullptr)
+    return {};
+  for (const auto &Section : MachO->sections()) {
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (!Name || *Name != "__compact_unwind")
+      continue;
+    auto Contents = Section.getContents();
+    EXPECT_TRUE(static_cast<bool>(Contents));
+    if (!Contents)
+      return {};
+    const auto Header = MachO->getSection64(Section.getRawDataRefImpl());
+    const auto Content = static_cast<size_t>(
+        reinterpret_cast<const WasmEdge::Byte *>(Contents->data()) -
+        Bytes.data());
+    return {Content, Header.nreloc};
+  }
+  ADD_FAILURE() << "generated object has no compact unwind section";
+  return {};
+}
+
+size_t compactUnwindRelocationFileOffset(std::vector<WasmEdge::Byte> &Bytes,
+                                         uint64_t FieldOffset) {
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "compact-unwind.o"));
+  EXPECT_TRUE(static_cast<bool>(Object));
+  if (!Object) {
+    llvm::consumeError(Object.takeError());
+    return 0;
+  }
+  const auto *MachO = llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Object);
+  EXPECT_NE(MachO, nullptr);
+  if (MachO == nullptr)
+    return 0;
+  for (const auto &Section : MachO->sections()) {
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (!Name || *Name != "__compact_unwind")
+      continue;
+    const auto Header = MachO->getSection64(Section.getRawDataRefImpl());
+    for (const auto &Relocation : Section.relocations()) {
+      if (Relocation.getOffset() == FieldOffset)
+        return Header.reloff + Relocation.getRawDataRefImpl().d.b * 8;
+    }
+  }
+  ADD_FAILURE() << "no compact unwind relocation at " << FieldOffset;
+  return 0;
+}
+
+std::vector<uint32_t>
+ehFrameFDEOffsets(const std::vector<WasmEdge::Byte> &Bytes) {
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "compact-unwind.o"));
+  EXPECT_TRUE(static_cast<bool>(Object));
+  if (!Object) {
+    llvm::consumeError(Object.takeError());
+    return {};
+  }
+  std::vector<uint32_t> Result;
+  for (const auto &Section : (*Object)->sections()) {
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (!Name || *Name != "__eh_frame")
+      continue;
+    for (const auto &Relocation : Section.relocations()) {
+      if (Relocation.getOffset() >= 8)
+        Result.push_back(static_cast<uint32_t>(Relocation.getOffset() - 8));
+    }
+  }
+  std::sort(Result.begin(), Result.end());
+  Result.erase(std::unique(Result.begin(), Result.end()), Result.end());
+  return Result;
 }
 
 size_t elf64RelocationSectionHeader(const std::vector<WasmEdge::Byte> &Bytes) {
@@ -1023,6 +1358,18 @@ TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
       0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
   const auto Output = Directory / "native.dylib";
   const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
+  auto Input =
+      ObjectReader::read(Object, nativeTarget(), ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Input);
+  const bool HasCompact = !Input->compactUnwind().empty();
+  const bool NeedsDwarf =
+      std::any_of(Input->compactUnwind().begin(), Input->compactUnwind().end(),
+                  [](const auto &Record) { return Record.FDE.has_value(); });
+  const bool HasInputEHFrame =
+      std::any_of(Input->sections().begin(), Input->sections().end(),
+                  [](const auto &Section) {
+                    return Section.Purpose == SectionPurpose::EHFrame;
+                  });
   ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Output, OutputKind::MachO));
 
   auto Image = llvm::object::ObjectFile::createObjectFile(Output.string());
@@ -1037,7 +1384,9 @@ TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
     ASSERT_TRUE(static_cast<bool>(Name));
     Sections.emplace(Name->str());
   }
-  EXPECT_TRUE(Sections.count("__eh_frame"));
+  EXPECT_EQ(Sections.count("__unwind_info") != 0, HasCompact);
+  EXPECT_EQ(Sections.count("__eh_frame") != 0,
+            HasInputEHFrame && (!HasCompact || NeedsDwarf));
   EXPECT_FALSE(Sections.count("__compact_unwind"));
   for (const auto &Symbol : MachO->symbols()) {
     auto Name = Symbol.getName();
@@ -1845,7 +2194,7 @@ TEST(LinkGraphTest, RejectsPatchOffsetsOutsideSectionContent) {
             "rebase offset is outside section content");
 }
 
-TEST(LinkGraphTest, ProvidesCheckedMutableGraphAccess) {
+TEST(LinkGraphTest, ProvidesCheckedSectionContentAccess) {
   LinkGraph Graph(Target::X86_64, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("input.o"));
   auto Text = Graph.addSection(
@@ -1860,9 +2209,14 @@ TEST(LinkGraphTest, ProvidesCheckedMutableGraphAccess) {
 
   ASSERT_TRUE(Graph.setSectionAddress(*Text, 64));
   ASSERT_TRUE(Graph.setSectionFileOffset(*Text, 32));
-  auto Content = Graph.sectionContent(*Text);
+  const LinkGraph &ConstGraph = Graph;
+  auto Content = ConstGraph.sectionContent(*Text);
   ASSERT_TRUE(Content);
-  (*Content)[0] = 0xCC;
+  static_assert(
+      std::is_const_v<
+          typename std::remove_reference_t<decltype(*Content)>::element_type>);
+  const std::array<WasmEdge::Byte, 1> Patch{0xCC};
+  ASSERT_TRUE(Graph.writeSectionContent(*Text, 0, Patch));
   const_cast<std::vector<Relocation> &>(Graph.relocations())[0].Addend = 8;
   const_cast<std::vector<Rebase> &>(Graph.rebases())[0].Addend = 16;
   EXPECT_EQ(Graph.sections()[*Text].Address, 64U);
@@ -1874,6 +2228,8 @@ TEST(LinkGraphTest, ProvidesCheckedMutableGraphAccess) {
   EXPECT_FALSE(Graph.setSectionAddress(InvalidSectionId, 0));
   EXPECT_FALSE(Graph.setSectionFileOffset(InvalidSectionId, 0));
   EXPECT_FALSE(Graph.sectionContent(InvalidSectionId));
+  EXPECT_FALSE(Graph.writeSectionContent(InvalidSectionId, 0, Patch));
+  EXPECT_FALSE(Graph.writeSectionContent(*Text, 5, Patch));
 }
 
 TEST(LinkGraphTest, ValidatesMutatedSectionInvariants) {
@@ -1883,8 +2239,6 @@ TEST(LinkGraphTest, ValidatesMutatedSectionInvariants) {
       Graph.addSection(Section{".text", SectionKind::Text, 1, 2, 0, 0, {0}});
   ASSERT_TRUE(Text);
 
-  auto Content = Graph.sectionContent(*Text);
-  ASSERT_TRUE(Content);
   auto &Sections = const_cast<std::vector<Section> &>(Graph.sections());
   Sections[*Text].Alignment = 0;
   auto AlignmentResult = Graph.validate();
@@ -1954,6 +2308,234 @@ TEST(LinkGraphTest, SectionOffsetsDefaultToZero) {
   EXPECT_EQ(Value.Address, 0U);
   EXPECT_EQ(Value.FileOffset, 0U);
   EXPECT_EQ(Value.VirtualSize, 0U);
+}
+
+TEST(LinkGraphTest, StoresValidOrderedCompactUnwindRecords) {
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text = Graph.addSection(Section{"__text",
+                                       SectionKind::Text,
+                                       4,
+                                       32,
+                                       0,
+                                       0,
+                                       {},
+                                       SectionPurpose::Default,
+                                       0x1000});
+  auto Data =
+      Graph.addSection(Section{"__data", SectionKind::Data, 8, 8, 0, 0, {}});
+  auto ReadOnly = Graph.addSection(
+      Section{"__const", SectionKind::ReadOnly, 8, 8, 0, 0, {}});
+  auto EHFrame = Graph.addSection(Section{"__eh_frame",
+                                          SectionKind::Unwind,
+                                          8,
+                                          8,
+                                          0,
+                                          0,
+                                          {},
+                                          SectionPurpose::EHFrame});
+  ASSERT_TRUE(Text && Data && ReadOnly && EHFrame);
+  auto First = Graph.addSymbol(Symbol{"first", *Text, 0, 0, false});
+  auto Second = Graph.addSymbol(Symbol{"second", *Text, 16, 0, false});
+  auto Personality = Graph.addSymbol(Symbol{"personality", *Data, 0, 0, false});
+  auto LSDA = Graph.addSymbol(Symbol{"lsda", *ReadOnly, 0, 0, false});
+  auto FDE = Graph.addSymbol(Symbol{"fde", *EHFrame, 0, 0, false});
+  ASSERT_TRUE(First && Second && Personality && LSDA && FDE);
+
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{*First, 16, 0x02000000, *Personality, *LSDA, *FDE}));
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{*Second, 8, 0x03000000, {}, {}, {}}));
+  ASSERT_EQ(Graph.compactUnwind().size(), 2U);
+  EXPECT_EQ(Graph.compactUnwind()[0].Function, *First);
+  EXPECT_EQ(Graph.compactUnwind()[1].Encoding, 0x03000000U);
+  EXPECT_TRUE(Graph.validate());
+}
+
+TEST(LinkGraphTest, RejectsInvalidCompactUnwindFunctionsAndRanges) {
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text = Graph.addSection(Section{"__text",
+                                       SectionKind::Text,
+                                       4,
+                                       16,
+                                       0,
+                                       0,
+                                       {},
+                                       SectionPurpose::Default,
+                                       UINT64_MAX - 7});
+  auto Data =
+      Graph.addSection(Section{"__data", SectionKind::Data, 4, 16, 0, 0, {}});
+  ASSERT_TRUE(Text && Data);
+  auto Function = Graph.addSymbol(Symbol{"function", *Text, 8, 0, false});
+  auto NonText = Graph.addSymbol(Symbol{"data", *Data, 0, 0, false});
+  ASSERT_TRUE(Function && NonText);
+  const auto Reject = [&](CompactUnwindRecord Record,
+                          std::string_view Message) {
+    auto Result = Graph.addCompactUnwind(Record);
+    ASSERT_FALSE(Result);
+    EXPECT_EQ(Result.error().Message, Message);
+  };
+
+  Reject({InvalidSymbolId, 1, 0, {}, {}, {}},
+         "invalid compact unwind function symbol ID");
+  Reject({*NonText, 1, 0, {}, {}, {}},
+         "compact unwind function must reference text section");
+  Reject({*Function, 0, 0, {}, {}, {}},
+         "compact unwind function length must be non-zero");
+  Reject({*Function, 9, 0, {}, {}, {}},
+         "compact unwind function range exceeds text section");
+  Reject({*Function, 8, 0, {}, {}, {}},
+         "compact unwind function address overflows");
+  EXPECT_TRUE(Graph.compactUnwind().empty());
+}
+
+TEST(LinkGraphTest, RejectsInvalidCompactUnwindOptionalSymbols) {
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  auto Text =
+      Graph.addSection(Section{"__text", SectionKind::Text, 4, 8, 0, 0, {}});
+  auto BSS =
+      Graph.addSection(Section{"__bss", SectionKind::BSS, 4, 8, 0, 0, {}});
+  auto Unwind = Graph.addSection(
+      Section{"__unwind", SectionKind::Unwind, 4, 8, 0, 0, {}});
+  auto Data =
+      Graph.addSection(Section{"__data", SectionKind::Data, 4, 8, 0, 0, {}});
+  auto ReadOnly = Graph.addSection(
+      Section{"__const", SectionKind::ReadOnly, 4, 8, 0, 0, {}});
+  auto EHFrame = Graph.addSection(Section{"__eh_frame",
+                                          SectionKind::Unwind,
+                                          4,
+                                          8,
+                                          0,
+                                          0,
+                                          {},
+                                          SectionPurpose::EHFrame});
+  auto Empty =
+      Graph.addSection(Section{"__empty", SectionKind::Data, 4, 0, 0, 0, {}});
+  ASSERT_TRUE(Text && BSS && Unwind && Data && ReadOnly && EHFrame && Empty);
+  auto Function = Graph.addSymbol(Symbol{"function", *Text, 0, 0, false});
+  auto BSSSymbol = Graph.addSymbol(Symbol{"bss", *BSS, 0, 0, false});
+  auto WrongFDE = Graph.addSymbol(Symbol{"fde", *Unwind, 0, 0, false});
+  auto PersonalityEnd =
+      Graph.addSymbol(Symbol{"personality_end", *Data, 8, 0, false});
+  auto LSDAEnd = Graph.addSymbol(Symbol{"lsda_end", *ReadOnly, 8, 0, false});
+  auto FDEEnd = Graph.addSymbol(Symbol{"fde_end", *EHFrame, 8, 0, false});
+  auto EmptySymbol = Graph.addSymbol(Symbol{"empty", *Empty, 0, 0, false});
+  ASSERT_TRUE(Function && BSSSymbol && WrongFDE && PersonalityEnd && LSDAEnd &&
+              FDEEnd && EmptySymbol);
+  const auto Reject = [&](CompactUnwindRecord Record,
+                          std::string_view Message) {
+    auto Result = Graph.addCompactUnwind(Record);
+    ASSERT_FALSE(Result);
+    EXPECT_EQ(Result.error().Message, Message);
+  };
+
+  Reject({*Function, 1, 0, InvalidSymbolId, {}, {}},
+         "invalid compact unwind personality symbol ID");
+  Reject({*Function, 1, 0, {}, InvalidSymbolId, {}},
+         "invalid compact unwind LSDA symbol ID");
+  Reject({*Function, 1, 0, {}, {}, InvalidSymbolId},
+         "invalid compact unwind FDE symbol ID");
+  Reject({*Function, 1, 0, *BSSSymbol, {}, {}},
+         "compact unwind personality must reference a non-BSS section");
+  Reject({*Function, 1, 0, {}, *BSSSymbol, {}},
+         "compact unwind LSDA must reference a non-BSS section");
+  Reject({*Function, 1, 0, {}, {}, *WrongFDE},
+         "compact unwind FDE must reference an EH frame section");
+
+  const auto RejectOutside = [&](CompactUnwindRecord Record, SymbolId Symbol,
+                                 SectionId Section, std::string_view SymbolName,
+                                 std::string_view SectionName) {
+    auto Result = Graph.addCompactUnwind(Record);
+    ASSERT_FALSE(Result);
+    EXPECT_EQ(Result.error().Message,
+              "compact unwind symbol is outside section storage");
+    EXPECT_EQ(Result.error().Symbol, Symbol);
+    EXPECT_EQ(Result.error().Section, Section);
+    EXPECT_EQ(Result.error().Offset, Graph.symbols()[Symbol].Offset);
+    EXPECT_EQ(Result.error().SymbolName, SymbolName);
+    EXPECT_EQ(Result.error().SectionName, SectionName);
+  };
+  RejectOutside({*Function, 1, 0, *PersonalityEnd, {}, {}}, *PersonalityEnd,
+                *Data, "personality_end", "__data");
+  RejectOutside({*Function, 1, 0, {}, *LSDAEnd, {}}, *LSDAEnd, *ReadOnly,
+                "lsda_end", "__const");
+  RejectOutside({*Function, 1, 0, {}, {}, *FDEEnd}, *FDEEnd, *EHFrame,
+                "fde_end", "__eh_frame");
+  RejectOutside({*Function, 1, 0, *EmptySymbol, {}, {}}, *EmptySymbol, *Empty,
+                "empty", "__empty");
+}
+
+TEST(LinkGraphTest, RejectsUnorderedAndOverlappingCompactUnwindRecords) {
+  const auto MakeGraph = [] {
+    LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+    EXPECT_TRUE(Graph.beginInput("input.o"));
+    EXPECT_TRUE(Graph.addSection(Section{"__text",
+                                         SectionKind::Text,
+                                         4,
+                                         32,
+                                         0,
+                                         0,
+                                         {},
+                                         SectionPurpose::Default,
+                                         0x1000}));
+    EXPECT_TRUE(Graph.addSymbol(Symbol{"first", 0, 0, 0, false}));
+    EXPECT_TRUE(Graph.addSymbol(Symbol{"second", 0, 8, 0, false}));
+    return Graph;
+  };
+  for (const auto &Second : {CompactUnwindRecord{0, 1, 0, {}, {}, {}},
+                             CompactUnwindRecord{1, 1, 0, {}, {}, {}},
+                             CompactUnwindRecord{1, 8, 0, {}, {}, {}}}) {
+    auto Graph = MakeGraph();
+    const CompactUnwindRecord First =
+        Second.Function == 1 && Second.Length == 8
+            ? CompactUnwindRecord{0, 16, 0, {}, {}, {}}
+            : CompactUnwindRecord{1, 1, 0, {}, {}, {}};
+    ASSERT_TRUE(Graph.addCompactUnwind(First));
+    auto Result = Graph.addCompactUnwind(Second);
+    ASSERT_FALSE(Result);
+    EXPECT_EQ(Result.error().Message,
+              Second.Function == 0 ? "compact unwind records are unordered"
+              : Second.Length == 1
+                  ? "duplicate compact unwind function address"
+                  : "overlapping compact unwind function ranges");
+  }
+}
+
+TEST(LinkGraphTest, RejectsCompactUnwindMutationAfterRelocation) {
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  ASSERT_TRUE(Graph.addSection(Section{"__text",
+                                       SectionKind::Text,
+                                       4,
+                                       16,
+                                       0,
+                                       0,
+                                       {},
+                                       SectionPurpose::Default,
+                                       0x1000}));
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"first", 0, 0, 0, false}));
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"second", 0, 8, 0, false}));
+  ASSERT_TRUE(Graph.addCompactUnwind(CompactUnwindRecord{0, 8, 0, {}, {}, {}}));
+  ASSERT_TRUE(Graph.addCompactUnwind(CompactUnwindRecord{1, 8, 0, {}, {}, {}}));
+  ASSERT_TRUE(applyRelocations(Graph));
+  auto Late = Graph.addCompactUnwind(CompactUnwindRecord{1, 8, 0, {}, {}, {}});
+  ASSERT_FALSE(Late);
+  EXPECT_EQ(Late.error().Message, "link graph relocations already applied");
+}
+
+TEST(LinkGraphTest, RejectsCompactUnwindForNonMachOGraphs) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::ELF);
+  ASSERT_TRUE(Graph.beginInput("input.o"));
+  ASSERT_TRUE(
+      Graph.addSection(Section{".text", SectionKind::Text, 1, 1, 0, 0, {0}}));
+  ASSERT_TRUE(Graph.addSymbol(Symbol{"function", 0, 0, 0, false}));
+  auto Result =
+      Graph.addCompactUnwind(CompactUnwindRecord{0, 1, 0, {}, {}, {}});
+  ASSERT_FALSE(Result);
+  EXPECT_EQ(Result.error().Message,
+            "compact unwind requires a Mach-O link graph");
 }
 
 TEST(LayoutTest, GroupsAndAlignsSections) {
@@ -2426,10 +3008,9 @@ TEST(RelocationTest, AppliesExplicitAndImplicitPC32AndPLT32) {
     auto Graph =
         makeRelocationGraph(Test.Type, Test.Addend, Test.Implicit, Test.Target);
     if (Test.Implicit) {
-      auto Content = Graph.sectionContent(0);
-      ASSERT_TRUE(Content);
-      ASSERT_TRUE(
-          Internal::writeSigned(*Content, 1, 4, Endianness::Little, -4));
+      std::array<WasmEdge::Byte, 4> Content{};
+      ASSERT_TRUE(Internal::writeSigned(Content, 0, 4, Endianness::Little, -4));
+      ASSERT_TRUE(Graph.writeSectionContent(0, 1, Content));
     }
     ASSERT_TRUE(applyRelocations(Graph));
     auto Value = Internal::readSigned(Graph.sections()[0].Content, 1, 4,
@@ -2462,8 +3043,8 @@ TEST(RelocationTest, AppliesMachOSignedSuffixBiasExactly) {
       auto TargetSymbol =
           Graph.addSymbol(Symbol{"_target", *TargetSection, 0, 1, false});
       ASSERT_TRUE(TargetSymbol);
-      ASSERT_TRUE(Internal::writeSigned(*Graph.sectionContent(*Patch), 0, 4,
-                                        Endianness::Little, 0));
+      const std::array<WasmEdge::Byte, 4> Zero{};
+      ASSERT_TRUE(Graph.writeSectionContent(*Patch, 0, Zero));
       ASSERT_TRUE(Graph.addRelocation(
           Relocation{*Patch, 0, Test.Type, *TargetSymbol, 0, true,
                      ObjectFormat::MachO, 4, true, false, false}));
@@ -2550,9 +3131,9 @@ TEST(RelocationTest, RelocatesGeneratedMachOSignedSuffixExactly) {
 
 TEST(RelocationTest, DecodesImplicitAddendForX86_64Absolute) {
   auto Graph = makeRelocationGraph(1, 0, true);
-  auto Content = Graph.sectionContent(0);
-  ASSERT_TRUE(Content);
-  ASSERT_TRUE(Internal::writeSigned(*Content, 1, 8, Endianness::Little, -5));
+  std::array<WasmEdge::Byte, 8> Content{};
+  ASSERT_TRUE(Internal::writeSigned(Content, 0, 8, Endianness::Little, -5));
+  ASSERT_TRUE(Graph.writeSectionContent(0, 1, Content));
   ASSERT_TRUE(applyRelocations(Graph));
   auto Value = Internal::readUnsigned(Graph.sections()[0].Content, 1, 8,
                                       Endianness::Little);
@@ -2608,14 +3189,11 @@ TEST(RelocationTest, RejectsInvalidGraphUnsupportedTargetTypeAndFormat) {
 
 TEST(RelocationTest, RelaxesX86_64RexGotpcrelxForDefinedSymbol) {
   auto Graph = makeRelocationGraph(42, -4);
-  auto Content = Graph.sectionContent(0);
-  ASSERT_TRUE(Content);
+  const std::array<WasmEdge::Byte, 3> Content{0x48, 0x8B, 0x05};
   auto &RelocationValue =
       const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
   RelocationValue.PatchSize = 4;
-  (*Content)[0] = 0x48;
-  (*Content)[1] = 0x8B;
-  (*Content)[2] = 0x05;
+  ASSERT_TRUE(Graph.writeSectionContent(0, 0, Content));
   RelocationValue.Offset = 3;
   ASSERT_TRUE(applyRelocations(Graph));
   EXPECT_EQ(Graph.sections()[0].Content[1], 0x8DU);
@@ -2644,9 +3222,7 @@ TEST(RelocationTest, ValidatesGotpcrelxInstructionAndAddend) {
   }};
   for (const auto &Test : Cases) {
     auto Graph = makeRelocationGraph(Test.Type, Test.Addend);
-    auto Content = Graph.sectionContent(0);
-    ASSERT_TRUE(Content);
-    std::copy(Test.Prefix.begin(), Test.Prefix.end(), Content->begin());
+    ASSERT_TRUE(Graph.writeSectionContent(0, 0, Test.Prefix));
     auto &RelocationValue =
         const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
     RelocationValue.Offset = Test.Offset;
@@ -2666,10 +3242,8 @@ TEST(RelocationTest, RelaxesExactGotpcrelxIndirectCallAndJump) {
   }};
   for (const auto &Test : Cases) {
     auto Graph = makeRelocationGraph(41, -4);
-    auto Content = Graph.sectionContent(0);
-    ASSERT_TRUE(Content);
-    (*Content)[0] = 0xFF;
-    (*Content)[1] = Test.ModRM;
+    const std::array<WasmEdge::Byte, 2> Content{0xFF, Test.ModRM};
+    ASSERT_TRUE(Graph.writeSectionContent(0, 0, Content));
     auto &RelocationValue =
         const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
     RelocationValue.Offset = 2;
@@ -2693,10 +3267,8 @@ TEST(RelocationTest, RelaxesGotpcrelxIndirectBranchesAboveFourGiB) {
   for (const auto &Test : Cases) {
     auto Graph = makeRelocationGraph(41, -4, false, UINT64_C(0x100000100),
                                      UINT64_C(0x100000000));
-    auto Content = Graph.sectionContent(0);
-    ASSERT_TRUE(Content);
-    (*Content)[0] = 0xFF;
-    (*Content)[1] = Test.ModRM;
+    const std::array<WasmEdge::Byte, 2> Content{0xFF, Test.ModRM};
+    ASSERT_TRUE(Graph.writeSectionContent(0, 0, Content));
     auto &RelocationValue =
         const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
     RelocationValue.Offset = 2;
@@ -2709,10 +3281,8 @@ TEST(RelocationTest, RelaxesGotpcrelxIndirectBranchesAboveFourGiB) {
 
 TEST(RelocationTest, RejectsGotpcrelxIndirectBranchDisplacementOverflow) {
   auto Graph = makeRelocationGraph(41, -4, false, UINT64_C(0x80001007), 0x1000);
-  auto Content = Graph.sectionContent(0);
-  ASSERT_TRUE(Content);
-  (*Content)[0] = 0xFF;
-  (*Content)[1] = 0x15;
+  const std::array<WasmEdge::Byte, 2> Content{0xFF, 0x15};
+  ASSERT_TRUE(Graph.writeSectionContent(0, 0, Content));
   auto &RelocationValue =
       const_cast<std::vector<Relocation> &>(Graph.relocations())[0];
   RelocationValue.Offset = 2;
@@ -2722,6 +3292,10 @@ TEST(RelocationTest, RejectsGotpcrelxIndirectBranchDisplacementOverflow) {
 
 TEST(RelocationTest, RejectsMutationAndLayoutAfterRelocation) {
   auto Graph = makeRelocationGraph(2, -4);
+  auto EHFrame = Graph.addSection(
+      Section{".eh_frame", SectionKind::Unwind, 8, 8, 0, 0,
+              std::vector<WasmEdge::Byte>(8), SectionPurpose::EHFrame});
+  ASSERT_TRUE(EHFrame);
   ASSERT_TRUE(applyRelocations(Graph));
   const auto ExpectRelocated = [](const auto &Result) {
     ASSERT_FALSE(Result);
@@ -2732,9 +3306,14 @@ TEST(RelocationTest, RejectsMutationAndLayoutAfterRelocation) {
   ExpectRelocated(Graph.addSymbol(Symbol{"new", 0, 0, 0, false}));
   ExpectRelocated(Graph.addRelocation(Relocation{0, 8, 2, 0, -4}));
   ExpectRelocated(Graph.addRebase(Rebase{0, 8, 1, 0, 8}));
+  const auto EHFrameReferences = Graph.ehFrameReferences();
+  ExpectRelocated(Graph.addEHFrameReference(EHFrameReference{*EHFrame, 0, 0}));
+  EXPECT_EQ(Graph.ehFrameReferences().size(), EHFrameReferences.size());
   ExpectRelocated(Graph.setSectionAddress(0, 3));
   ExpectRelocated(Graph.setSectionFileOffset(0, 3));
-  ExpectRelocated(Graph.sectionContent(0));
+  const std::array<WasmEdge::Byte, 1> Patch{0};
+  ExpectRelocated(Graph.writeSectionContent(0, 0, Patch));
+  EXPECT_TRUE(Graph.sectionContent(0));
   auto LayoutResult = layout(Graph);
   ASSERT_FALSE(LayoutResult);
   EXPECT_EQ(LayoutResult.error().Message, "cannot layout relocated link graph");
@@ -2788,8 +3367,9 @@ LinkGraph makeELFRelocationGraph(
 TEST(ARMRelocationTest, AppliesDataRelocationsAndPreservesPrel31TopBit) {
   auto Absolute = makeELFRelocationGraph(Target::ARM, Endianness::Little, 2, 4,
                                          0x2000, 0x1000, 0, 0, true);
-  ASSERT_TRUE(Internal::writeSigned(*Absolute.sectionContent(0), 0, 4,
-                                    Endianness::Little, -4));
+  std::array<WasmEdge::Byte, 4> Addend{};
+  ASSERT_TRUE(Internal::writeSigned(Addend, 0, 4, Endianness::Little, -4));
+  ASSERT_TRUE(Absolute.writeSectionContent(0, 0, Addend));
   ASSERT_TRUE(applyRelocations(Absolute));
   EXPECT_EQ(*Internal::readUnsigned(Absolute.sections()[0].Content, 0, 4,
                                     Endianness::Little),
@@ -4218,25 +4798,18 @@ TEST(RelocationTest, ReadsRealisticPortableObjectsWithoutPersonality) {
 }
 
 TEST(EHFrameTest, NormalizesGeneratedMachOFrames) {
-  constexpr std::string_view Anchor = R"(
-.private_extern _wasmedge_unwind_anchor
-_wasmedge_unwind_anchor:
-  .cfi_startproc
-  .cfi_def_cfa_offset 16
-  .cfi_escape 0x2e, 0x10
-  ret
-  .cfi_endproc
-)";
   for (const auto &[Triple, Architecture] :
        std::array<std::pair<const char *, Target>, 2>{{
            {"x86_64-apple-macosx", Target::X86_64},
            {"arm64-apple-macosx", Target::AArch64},
        }}) {
-    const auto Object = makeObject(
-        llvm::Triple(Triple), false, false, "f0", {}, false, false, "generic",
-        {}, true, false, false, false, false, false, std::string(Anchor));
-    auto Graph = ObjectReader::read(Object, Architecture);
+    const auto Object = makeObject(llvm::Triple(Triple), false, false, "f0", {},
+                                   false, false, "generic", {}, true, false,
+                                   false, false, false, false, {}, false, true);
+    auto Graph =
+        ObjectReader::read(Object, Architecture, ObjectReaderPolicy::Universal);
     ASSERT_TRUE(Graph) << Triple;
+    ASSERT_TRUE(compactUnwindToEHFrame(*Graph)) << Triple;
     ASSERT_TRUE(layout(*Graph, 0, 0x4000));
     ASSERT_TRUE(normalizeMachOEHFrame(*Graph)) << Triple;
     constexpr uint64_t FirstBase = UINT64_C(0x100000000);
@@ -4246,10 +4819,10 @@ _wasmedge_unwind_anchor:
     ASSERT_TRUE(First) << Triple;
     ASSERT_TRUE(Second) << Triple;
     ASSERT_EQ(First->size(), Second->size());
-    EXPECT_GE(First->size(), 2U) << Triple;
+    EXPECT_EQ(First->size(), 2U) << Triple;
     for (size_t I = 0; I < First->size(); ++I)
       EXPECT_EQ((*First)[I] - FirstBase, (*Second)[I] - SecondBase) << Triple;
-    for (const std::string_view Name : {"_f0", "_wasmedge_unwind_anchor"}) {
+    for (const std::string_view Name : {"_f0", "_t0"}) {
       const auto Symbol =
           std::find_if(Graph->symbols().begin(), Graph->symbols().end(),
                        [&](const auto &Value) { return Value.Name == Name; });
@@ -4263,24 +4836,355 @@ _wasmedge_unwind_anchor:
   }
 }
 
+TEST(CompactUnwindTest, InventoriesObservedLLVMGeneratedMachORecords) {
+  struct Fixture {
+    const char *Name;
+    bool UnwindTable;
+    bool Optimize;
+    bool Representative;
+    bool Exceptions;
+    bool TypeWrapper;
+  };
+  constexpr std::array<Fixture, 6> Fixtures{{
+      {"leaf", false, false, false, false, false},
+      {"default-unwind", true, false, false, false, false},
+      {"optimized-unwind", true, true, false, false, false},
+      {"representative-mixed", true, true, true, false, false},
+      {"type-wrapper-compact-only", true, false, false, false, true},
+      {"exceptions-mixed-zero-compact-personality-lsda", true, false, false,
+       true, false},
+  }};
+  for (const char *Triple : {"x86_64-apple-macosx", "arm64-apple-macosx"}) {
+    for (const auto &Fixture : Fixtures) {
+      const auto Inventory = collectCompactUnwindInventory(
+          makeObject(llvm::Triple(Triple), false, false, "f0", {}, false, false,
+                     "generic", {}, Fixture.UnwindTable, Fixture.Optimize,
+                     false, false, Fixture.Representative, Fixture.Exceptions,
+                     {}, false, Fixture.TypeWrapper));
+      if (std::string_view(Triple) == "x86_64-apple-macosx") {
+        EXPECT_FALSE(Inventory.HasCompactUnwind) << Fixture.Name;
+        EXPECT_TRUE(Inventory.Records.empty()) << Fixture.Name;
+        EXPECT_TRUE(Inventory.Relocations.empty()) << Fixture.Name;
+        EXPECT_EQ(Inventory.HasEHFrame, Fixture.UnwindTable) << Fixture.Name;
+        continue;
+      }
+      if (!Fixture.UnwindTable) {
+        EXPECT_FALSE(Inventory.HasCompactUnwind) << Fixture.Name;
+        EXPECT_TRUE(Inventory.Records.empty()) << Fixture.Name;
+        EXPECT_TRUE(Inventory.Relocations.empty()) << Fixture.Name;
+        EXPECT_FALSE(Inventory.HasEHFrame) << Fixture.Name;
+        continue;
+      }
+      const size_t ExpectedCount = Fixture.TypeWrapper  ? 2U
+                                   : Fixture.Exceptions ? 3U
+                                                        : 1U;
+      ASSERT_TRUE(Inventory.HasCompactUnwind) << Fixture.Name;
+      ASSERT_EQ(Inventory.Records.size(), ExpectedCount) << Fixture.Name;
+      ASSERT_EQ(Inventory.Relocations.size(), ExpectedCount) << Fixture.Name;
+      const bool MixedCompactAndDwarf =
+          Fixture.Representative || Fixture.Exceptions;
+      EXPECT_EQ(Inventory.HasEHFrame, MixedCompactAndDwarf) << Fixture.Name;
+      uint64_t Function = 0;
+      std::set<uint64_t> RelocationOffsets;
+      std::set<std::string> RelocationSymbols;
+      for (size_t I = 0; I < Inventory.Records.size(); ++I) {
+        const auto &Record = Inventory.Records[I];
+        EXPECT_EQ(Record.Function, Function) << Fixture.Name << " " << I;
+        EXPECT_GT(Record.Length, 0U) << Fixture.Name << " " << I;
+        EXPECT_EQ(Record.Encoding,
+                  I == 0 && (Fixture.Representative || Fixture.Exceptions)
+                      ? UINT32_C(0x03000000)
+                      : UINT32_C(0x02000000))
+            << Fixture.Name << " " << I;
+        EXPECT_EQ(Record.Personality, 0U) << Fixture.Name << " " << I;
+        EXPECT_EQ(Record.LSDA, 0U) << Fixture.Name << " " << I;
+        Function += Record.Length;
+      }
+      for (const auto &Relocation : Inventory.Relocations) {
+        EXPECT_EQ(Relocation.Type,
+                  static_cast<uint64_t>(llvm::MachO::ARM64_RELOC_UNSIGNED))
+            << Fixture.Name;
+        EXPECT_EQ(Relocation.Offset % sizeof(RawCompactUnwindRecord), 0U)
+            << Fixture.Name;
+        RelocationOffsets.emplace(Relocation.Offset);
+        RelocationSymbols.emplace(Relocation.Symbol);
+      }
+      std::set<uint64_t> ExpectedOffsets;
+      for (size_t I = 0; I < ExpectedCount; ++I)
+        ExpectedOffsets.emplace(I * sizeof(RawCompactUnwindRecord));
+      EXPECT_EQ(RelocationOffsets, ExpectedOffsets) << Fixture.Name;
+      EXPECT_EQ(RelocationSymbols, (std::set<std::string>{""})) << Fixture.Name;
+    }
+  }
+}
+
+LinkGraph makeCompactUnwindGraph(Target Architecture, uint32_t Encoding,
+                                 std::string Name = "_f0") {
+  LinkGraph Graph(Architecture, Endianness::Little, ObjectFormat::MachO);
+  EXPECT_TRUE(Graph.beginInput("compact.o"));
+  auto Text = Graph.addSection(Section{"__text", SectionKind::Text, 4, 64, 0, 0,
+                                       std::vector<WasmEdge::Byte>(64),
+                                       SectionPurpose::Default, 0x1000});
+  EXPECT_TRUE(Text);
+  auto Function =
+      Graph.addSymbol(Symbol{std::move(Name), *Text, 0, 16, true, {}, true});
+  EXPECT_TRUE(Function);
+  EXPECT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{*Function, 16, Encoding, {}, {}, {}}));
+  return Graph;
+}
+
+TEST(CompactUnwindTest, ConvertsAArch64FramelessAndSemanticCoverage) {
+  auto Graph = makeCompactUnwindGraph(Target::AArch64, 0x02002000);
+  ASSERT_TRUE(compactUnwindToEHFrame(Graph));
+  ASSERT_TRUE(layout(Graph, 0, 0x4000));
+  ASSERT_TRUE(normalizeMachOEHFrame(Graph));
+  EXPECT_TRUE(validateMachOEHFrameCoverage(Graph));
+  const auto Starts = machOEHFrameStarts(Graph, 0);
+  ASSERT_TRUE(Starts);
+  ASSERT_EQ(Starts->size(), 1U);
+  EXPECT_EQ(Starts->front(), Graph.sections().front().Address);
+  const auto EH =
+      std::find_if(Graph.sections().begin(), Graph.sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::EHFrame;
+                   });
+  ASSERT_NE(EH, Graph.sections().end());
+  const std::vector<WasmEdge::Byte> CFI{0x0C, 31, 32, 0x08, 30};
+  EXPECT_NE(std::search(EH->Content.begin(), EH->Content.end(), CFI.begin(),
+                        CFI.end()),
+            EH->Content.end());
+  ASSERT_GE(EH->Content.size(), 4U);
+  EXPECT_EQ(
+      std::vector<WasmEdge::Byte>(EH->Content.end() - 4, EH->Content.end()),
+      std::vector<WasmEdge::Byte>(4));
+}
+
+TEST(CompactUnwindTest, ConvertsX86RBPFrame) {
+  auto Graph = makeCompactUnwindGraph(Target::X86_64, 0x01010001);
+  ASSERT_TRUE(compactUnwindToEHFrame(Graph));
+  ASSERT_TRUE(layout(Graph, 0, 0x4000));
+  ASSERT_TRUE(normalizeMachOEHFrame(Graph));
+  const auto Starts = machOEHFrameStarts(Graph, 0);
+  ASSERT_TRUE(Starts);
+  EXPECT_EQ(Starts->size(), 1U);
+  const auto EH =
+      std::find_if(Graph.sections().begin(), Graph.sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::EHFrame;
+                   });
+  ASSERT_NE(EH, Graph.sections().end());
+  const std::vector<WasmEdge::Byte> CFI{0x0C, 6, 16, 0x90, 1, 0x86, 2, 0x83, 3};
+  EXPECT_NE(std::search(EH->Content.begin(), EH->Content.end(), CFI.begin(),
+                        CFI.end()),
+            EH->Content.end());
+}
+
+TEST(CompactUnwindTest, ConvertsMultipleOrderedRecords) {
+  auto Graph = makeCompactUnwindGraph(Target::AArch64, 0x02000000, "_t0");
+  auto Second = Graph.addSymbol(Symbol{"_f0", 0, 16, 16, true, {}, true});
+  ASSERT_TRUE(Second);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{*Second, 16, 0x02001000, {}, {}, {}}));
+  ASSERT_TRUE(compactUnwindToEHFrame(Graph));
+  ASSERT_TRUE(layout(Graph, 0, 0x4000));
+  ASSERT_TRUE(normalizeMachOEHFrame(Graph));
+  EXPECT_TRUE(validateMachOEHFrameCoverage(Graph));
+  const auto Starts = machOEHFrameStarts(Graph, 0);
+  ASSERT_TRUE(Starts);
+  EXPECT_EQ(Starts->size(), 2U);
+  EXPECT_TRUE(std::is_sorted(Starts->begin(), Starts->end()));
+}
+
+TEST(CompactUnwindTest, RejectsUnsupportedRecordsAtomically) {
+  for (const auto &[Architecture, Encoding] :
+       std::array<std::pair<Target, uint32_t>, 2>{
+           {{Target::AArch64, UINT32_C(0x02000020)},
+            {Target::X86_64, UINT32_C(0x01010009)}}}) {
+    auto Graph = makeCompactUnwindGraph(Architecture, Encoding);
+    const auto Sections = Graph.sections();
+    const auto References = Graph.ehFrameReferences();
+    EXPECT_FALSE(compactUnwindToEHFrame(Graph));
+    EXPECT_EQ(Graph.sections().size(), Sections.size());
+    EXPECT_EQ(Graph.ehFrameReferences().size(), References.size());
+    EXPECT_EQ(Graph.sections().front().Content, Sections.front().Content);
+  }
+  auto Graph = makeCompactUnwindGraph(Target::AArch64, 0x42000000);
+  EXPECT_FALSE(compactUnwindToEHFrame(Graph));
+  EXPECT_EQ(Graph.sections().size(), 1U);
+
+  auto MissingFDE = makeCompactUnwindGraph(Target::AArch64, 0x03000000);
+  EXPECT_FALSE(compactUnwindToEHFrame(MissingFDE));
+  EXPECT_EQ(MissingFDE.sections().size(), 1U);
+
+  for (const bool HasLSDA : {false, true}) {
+    LinkGraph Optional(Target::AArch64, Endianness::Little,
+                       ObjectFormat::MachO);
+    ASSERT_TRUE(Optional.beginInput("optional.o"));
+    auto Text = Optional.addSection(
+        Section{"__text", SectionKind::Text, 4, 16, 0, 0,
+                std::vector<WasmEdge::Byte>(16), SectionPurpose::Default});
+    auto Data = Optional.addSection(
+        Section{"__data", SectionKind::Data, 8, 8, 0, 0,
+                std::vector<WasmEdge::Byte>(8), SectionPurpose::Default});
+    ASSERT_TRUE(Text && Data);
+    auto Function =
+        Optional.addSymbol(Symbol{"_f0", *Text, 0, 16, true, {}, true});
+    auto Value = Optional.addSymbol(Symbol{"optional", *Data, 0, 8, false});
+    ASSERT_TRUE(Function && Value);
+    ASSERT_TRUE(Optional.addCompactUnwind(CompactUnwindRecord{
+        *Function,
+        16,
+        0x02000000,
+        HasLSDA ? std::optional<SymbolId>{} : std::optional<SymbolId>{*Value},
+        HasLSDA ? std::optional<SymbolId>{*Value} : std::optional<SymbolId>{},
+        {}}));
+    EXPECT_FALSE(compactUnwindToEHFrame(Optional));
+    EXPECT_EQ(Optional.sections().size(), 2U);
+  }
+}
+
+TEST(CompactUnwindTest, PreservesExistingDwarfFallbackAndSynthesizesMissing) {
+  auto Existing = makeCompactUnwindGraph(Target::AArch64, 0x02000000);
+  ASSERT_TRUE(compactUnwindToEHFrame(Existing));
+  const auto ExistingEH =
+      std::find_if(Existing.sections().begin(), Existing.sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::EHFrame;
+                   });
+  ASSERT_NE(ExistingEH, Existing.sections().end());
+  ASSERT_EQ(Existing.ehFrameReferences().size(), 1U);
+
+  LinkGraph Graph(Target::AArch64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("mixed.o"));
+  auto Text = Graph.addSection(Section{"__text", SectionKind::Text, 4, 64, 0, 0,
+                                       std::vector<WasmEdge::Byte>(64),
+                                       SectionPurpose::Default, 0x1000});
+  auto EH = Graph.addSection(*ExistingEH);
+  ASSERT_TRUE(Text && EH);
+  auto First = Graph.addSymbol(Symbol{"_t0", *Text, 0, 16, true, {}, true});
+  auto Second = Graph.addSymbol(Symbol{"_f0", *Text, 16, 16, true, {}, true});
+  ASSERT_TRUE(First && Second);
+  ASSERT_TRUE(Graph.addEHFrameReference(EHFrameReference{
+      *EH, Existing.ehFrameReferences().front().Offset, *First}));
+  auto FDE = Graph.addSymbol(
+      Symbol{"fallback_fde", *EH,
+             Existing.ehFrameReferences().front().Offset - 8, 0, false});
+  ASSERT_TRUE(FDE);
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{*First, 16, 0x03000000, {}, {}, *FDE}));
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{*Second, 16, 0x02000000, {}, {}, {}}));
+  ASSERT_TRUE(compactUnwindToEHFrame(Graph));
+  EXPECT_EQ(std::count_if(Graph.sections().begin(), Graph.sections().end(),
+                          [](const auto &Section) {
+                            return Section.Purpose == SectionPurpose::EHFrame;
+                          }),
+            1);
+  ASSERT_TRUE(layout(Graph, 0, 0x4000));
+  ASSERT_TRUE(normalizeMachOEHFrame(Graph));
+  EXPECT_TRUE(validateMachOEHFrameCoverage(Graph));
+  const auto Starts = machOEHFrameStarts(Graph, 0);
+  ASSERT_TRUE(Starts);
+  EXPECT_EQ(Starts->size(), 2U);
+}
+
+TEST_F(LinkerOutputTest, WritesConvertedCompactUnwindToUniversalWasm) {
+  constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
+      0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
+      0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
+      0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
+  const auto Object = makeObject(
+      llvm::Triple("arm64-apple-macosx"), false, false, "f0", {}, false, false,
+      "generic", {}, true, false, false, false, false, false, {}, true, true);
+  auto Graph = ObjectReader::read(Object, Target::AArch64,
+                                  ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  ASSERT_EQ(Graph->compactUnwind().size(), 2U);
+  ASSERT_TRUE(compactUnwindToEHFrame(*Graph));
+  ASSERT_TRUE(layout(*Graph, 0, 0x4000));
+  ASSERT_TRUE(normalizeMachOEHFrame(*Graph));
+  ASSERT_TRUE(validateMachOEHFrameCoverage(*Graph));
+  const auto Starts = machOEHFrameStarts(*Graph, 0);
+  ASSERT_TRUE(Starts);
+  ASSERT_EQ(Starts->size(), 2U);
+  for (const std::string_view Name : {"_f0", "_t0"}) {
+    const auto Symbol =
+        std::find_if(Graph->symbols().begin(), Graph->symbols().end(),
+                     [&](const auto &Value) { return Value.Name == Name; });
+    ASSERT_NE(Symbol, Graph->symbols().end()) << Name;
+    const uint64_t Address =
+        Graph->sections()[Symbol->Section].Address + Symbol->Offset;
+    EXPECT_NE(std::find(Starts->begin(), Starts->end(), Address), Starts->end())
+        << Name;
+  }
+  ASSERT_TRUE(applyRelocations(*Graph));
+
+  const auto Output = Directory / "compact-unwind.wasm";
+  ASSERT_TRUE(UniversalWasmWriter::write(*Graph, TinyWasm, Output));
+  const auto Bytes = readFile(Output);
+  ASSERT_GT(Bytes.size(), TinyWasm.size());
+  EXPECT_TRUE(std::equal(TinyWasm.begin(), TinyWasm.end(), Bytes.begin()));
+  size_t Cursor = TinyWasm.size();
+  ASSERT_EQ(Bytes[Cursor++], 0U);
+  const auto ReadULEB = [&](size_t &Offset) {
+    uint64_t Value = 0;
+    unsigned Shift = 0;
+    while (Offset < Bytes.size()) {
+      const WasmEdge::Byte Part = Bytes[Offset++];
+      Value |= static_cast<uint64_t>(Part & 0x7F) << Shift;
+      if ((Part & 0x80) == 0)
+        return Value;
+      Shift += 7;
+    }
+    return UINT64_MAX;
+  };
+  const uint64_t PayloadSize = ReadULEB(Cursor);
+  ASSERT_EQ(Cursor + PayloadSize, Bytes.size());
+  const uint64_t NameSize = ReadULEB(Cursor);
+  ASSERT_EQ(
+      std::string_view(reinterpret_cast<const char *>(Bytes.data() + Cursor),
+                       NameSize),
+      "wasmedge");
+  Cursor += NameSize;
+  EXPECT_EQ(ReadULEB(Cursor), WasmEdge::AOT::kBinaryVersion);
+  static_cast<void>(Bytes[Cursor++]);
+  EXPECT_EQ(Bytes[Cursor++], 2U);
+  for (unsigned I = 0; I < 2; ++I)
+    static_cast<void>(ReadULEB(Cursor));
+  for (unsigned List = 0; List < 2; ++List) {
+    const uint64_t Count = ReadULEB(Cursor);
+    for (uint64_t I = 0; I < Count; ++I)
+      static_cast<void>(ReadULEB(Cursor));
+  }
+  const uint64_t SectionCount = ReadULEB(Cursor);
+  std::vector<WasmEdge::Byte> Unwind;
+  for (uint64_t I = 0; I < SectionCount; ++I) {
+    const WasmEdge::Byte Kind = Bytes[Cursor++];
+    static_cast<void>(ReadULEB(Cursor));
+    static_cast<void>(ReadULEB(Cursor));
+    const uint64_t ContentSize = ReadULEB(Cursor);
+    ASSERT_LE(ContentSize, Bytes.size() - Cursor);
+    if (Kind == 4)
+      Unwind.assign(Bytes.begin() + Cursor,
+                    Bytes.begin() + Cursor + ContentSize);
+    Cursor += ContentSize;
+  }
+  ASSERT_FALSE(Unwind.empty());
+  EXPECT_EQ(std::vector<WasmEdge::Byte>(Unwind.end() - 4, Unwind.end()),
+            std::vector<WasmEdge::Byte>(4));
+}
+
 TEST(MachOWriterTest, LinksGeneratedMacOSObjects) {
-  constexpr std::string_view Anchor = R"(
-.private_extern _wasmedge_unwind_anchor
-_wasmedge_unwind_anchor:
-  .cfi_startproc
-  .cfi_def_cfa_offset 16
-  .cfi_escape 0x2e, 0x10
-  ret
-  .cfi_endproc
-)";
   for (const auto &[Triple, Architecture] :
        std::array<std::pair<const char *, Target>, 2>{{
            {"x86_64-apple-macosx", Target::X86_64},
            {"arm64-apple-macosx", Target::AArch64},
        }}) {
-    const auto Object = makeObject(
-        llvm::Triple(Triple), false, false, "f0", {}, false, false, "generic",
-        {}, true, false, false, false, false, false, std::string(Anchor), true);
+    const auto Object =
+        makeObject(llvm::Triple(Triple), false, false, "f0", {}, false, false,
+                   "generic", {}, true, false, false, false, false, false, {},
+                   true, true, false, false, false, true);
     auto Parsed =
         llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
             llvm::StringRef(reinterpret_cast<const char *>(Object.data()),
@@ -4293,14 +5197,43 @@ _wasmedge_unwind_anchor:
       ASSERT_TRUE(static_cast<bool>(Name));
       InputSections.emplace(Name->str());
     }
-    EXPECT_TRUE(InputSections.count("__eh_frame")) << Triple;
+    EXPECT_EQ(InputSections.count("__compact_unwind") != 0,
+              Architecture == Target::AArch64)
+        << Triple;
+    EXPECT_EQ(InputSections.count("__eh_frame") != 0,
+              Architecture == Target::X86_64)
+        << Triple;
     auto Graph =
         ObjectReader::read(Object, Architecture, ObjectReaderPolicy::Universal);
     ASSERT_TRUE(Graph) << Triple;
+    const bool HasCompact = !Graph->compactUnwind().empty();
+    const bool NeedsDwarf = std::any_of(
+        Graph->compactUnwind().begin(), Graph->compactUnwind().end(),
+        [](const auto &Record) { return Record.FDE.has_value(); });
+    const bool HasInputEHFrame =
+        std::any_of(Graph->sections().begin(), Graph->sections().end(),
+                    [](const auto &Section) {
+                      return Section.Purpose == SectionPurpose::EHFrame;
+                    });
+    if (HasCompact) {
+      ASSERT_TRUE(Graph->pruneUnreferencedMachOEHFrame()) << Triple;
+    }
+    if (!Graph->compactUnwind().empty()) {
+      ASSERT_TRUE(reserveMachOUnwindInfo(*Graph)) << Triple;
+    }
     ASSERT_TRUE(MachOWriter::layout(*Graph)) << Triple;
     ASSERT_TRUE(normalizeMachOEHFrame(*Graph)) << Triple;
     ASSERT_TRUE(validateMachOEHFrameCoverage(*Graph)) << Triple;
     ASSERT_TRUE(applyRelocations(*Graph)) << Triple;
+    if (!Graph->compactUnwind().empty()) {
+      ASSERT_TRUE(populateMachOUnwindInfo(*Graph)) << Triple;
+      const auto Unwind =
+          std::find_if(Graph->sections().begin(), Graph->sections().end(),
+                       [](const auto &Section) {
+                         return Section.Purpose == SectionPurpose::UnwindInfo;
+                       });
+      ASSERT_NE(Unwind, Graph->sections().end()) << Triple;
+    }
     std::vector<WasmEdge::Byte> Bytes;
     Writer Output(Bytes);
     ASSERT_TRUE(MachOWriter::write(*Graph, Output)) << Triple;
@@ -4311,6 +5244,37 @@ _wasmedge_unwind_anchor:
             "generated.dylib"));
     ASSERT_TRUE(static_cast<bool>(Image))
         << Triple << " " << llvm::toString(Image.takeError());
+    bool HasEHFrame = false;
+    std::vector<WasmEdge::Byte> FinalUnwind;
+    for (const auto &Section : (*Image)->sections()) {
+      auto Name = Section.getName();
+      ASSERT_TRUE(static_cast<bool>(Name));
+      HasEHFrame |= *Name == "__eh_frame";
+      if (*Name == "__unwind_info") {
+        auto Content = Section.getContents();
+        ASSERT_TRUE(static_cast<bool>(Content));
+        FinalUnwind.assign(Content->bytes_begin(), Content->bytes_end());
+      }
+    }
+    EXPECT_EQ(HasEHFrame, HasInputEHFrame && (!HasCompact || NeedsDwarf))
+        << Triple;
+    EXPECT_EQ(!FinalUnwind.empty(), HasCompact) << Triple;
+    if (HasCompact) {
+      const auto FunctionOffsets = machOUnwindFunctionStarts(FinalUnwind);
+      ASSERT_TRUE(FunctionOffsets) << Triple;
+      for (const std::string_view Name : {"_f0", "_t0"}) {
+        const auto Symbol =
+            std::find_if(Graph->symbols().begin(), Graph->symbols().end(),
+                         [&](const auto &Value) { return Value.Name == Name; });
+        ASSERT_NE(Symbol, Graph->symbols().end()) << Triple << " " << Name;
+        const auto Address = static_cast<uint32_t>(
+            Graph->sections()[Symbol->Section].Address + Symbol->Offset);
+        EXPECT_NE(std::find(FunctionOffsets->begin(), FunctionOffsets->end(),
+                            Address),
+                  FunctionOffsets->end())
+            << Triple << " " << Name;
+      }
+    }
   }
 }
 
@@ -4627,21 +5591,13 @@ TEST(NativeLinkerTest, SelectsCRTMarkerPolicyFromHostABI) {
 }
 
 TEST(EHFrameTest, RequiresTypeWrapperCoverage) {
-  constexpr std::string_view Anchor = R"(
-.private_extern _wasmedge_unwind_anchor
-_wasmedge_unwind_anchor:
-  .cfi_startproc
-  .cfi_def_cfa_offset 16
-  .cfi_escape 0x2e, 0x10
-  ret
-  .cfi_endproc
-)";
-  auto Graph = ObjectReader::read(
-      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
-                 false, false, "generic", {}, true, false, false, false, false,
-                 false, std::string(Anchor), false, true),
-      Target::AArch64);
+  auto Object = makeObject(llvm::Triple("arm64-apple-macosx"), false, false,
+                           "f0", {}, false, false, "generic", {}, true, false,
+                           false, false, false, false, {}, false, true);
+  auto Graph = ObjectReader::read(Object, Target::AArch64,
+                                  ObjectReaderPolicy::Universal);
   ASSERT_TRUE(Graph);
+  ASSERT_TRUE(compactUnwindToEHFrame(*Graph));
   ASSERT_TRUE(layout(*Graph, 0, 0x4000));
   ASSERT_TRUE(normalizeMachOEHFrame(*Graph));
   ASSERT_TRUE(validateMachOEHFrameCoverage(*Graph));
@@ -4689,7 +5645,9 @@ _wasmedge_unwind_anchor:
       if (Graph->sections()[EHId].Address + Field + Delta == T0Address) {
         Delta = static_cast<int64_t>(F0Address -
                                      (Graph->sections()[EHId].Address + Field));
-        std::memcpy(Content->data() + Field, &Delta, sizeof(Delta));
+        std::array<WasmEdge::Byte, sizeof(Delta)> Replacement{};
+        std::memcpy(Replacement.data(), &Delta, sizeof(Delta));
+        ASSERT_TRUE(Graph->writeSectionContent(EHId, Field, Replacement));
         Mutated = true;
         break;
       }
@@ -4701,21 +5659,13 @@ _wasmedge_unwind_anchor:
 }
 
 TEST(EHFrameTest, CollapsesAliasedSemanticFunctionAddresses) {
-  auto Covered = ObjectReader::read(
-      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
-                 false, false, "generic", {}, true, false, false, false, false,
-                 false, R"(
-.private_extern _wasmedge_unwind_anchor
-_wasmedge_unwind_anchor:
-  .cfi_startproc
-  .cfi_def_cfa_offset 16
-  .cfi_escape 0x2e, 0x10
-  ret
-  .cfi_endproc
-)",
-                 false, true),
-      Target::AArch64);
+  auto Object = makeObject(llvm::Triple("arm64-apple-macosx"), false, false,
+                           "f0", {}, false, false, "generic", {}, true, false,
+                           false, false, false, false, {}, false, true);
+  auto Covered = ObjectReader::read(Object, Target::AArch64,
+                                    ObjectReaderPolicy::Universal);
   ASSERT_TRUE(Covered);
+  ASSERT_TRUE(compactUnwindToEHFrame(*Covered));
   ASSERT_TRUE(layout(*Covered, 0, 0x4000));
   auto &Symbols = const_cast<std::vector<Symbol> &>(Covered->symbols());
   const auto T0 =
@@ -4785,13 +5735,626 @@ TEST(EHFrameTest, RejectsMalformedRecordsAtomically) {
   EXPECT_EQ(Graph.sections()[0].Content, Before);
 }
 
-TEST(ObjectReaderTest, AppliesUniversalMachOUnwindPolicy) {
+TEST(EHFrameTest, ReportsFDEInitialLocationFields) {
+  const auto Bytes = makeAArch64MachOEHFrameObject();
+  const auto Object = machOEHFrameObject(Bytes);
+  ASSERT_NE(Object.Content, 0U);
+  auto Parsed =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "eh-frame.o"));
+  ASSERT_TRUE(static_cast<bool>(Parsed));
+  for (const auto &Section : (*Parsed)->sections()) {
+    auto Name = Section.getName();
+    ASSERT_TRUE(static_cast<bool>(Name));
+    if (*Name != "__eh_frame")
+      continue;
+    auto Content = Section.getContents();
+    ASSERT_TRUE(static_cast<bool>(Content));
+    const std::vector<WasmEdge::Byte> Frame(Content->bytes_begin(),
+                                            Content->bytes_end());
+    auto Fields = machOEHFrameFields(Frame, Target::AArch64);
+    ASSERT_TRUE(Fields);
+    ASSERT_EQ(Fields->size(), 1U);
+    return;
+  }
+  FAIL() << "generated object has no EH frame section";
+}
+
+TEST(EHFrameTest, RejectsReferenceOutsideFDEInitialLocationField) {
+  auto Source = makeCompactUnwindGraph(Target::AArch64, 0x02000000);
+  ASSERT_TRUE(compactUnwindToEHFrame(Source));
+  ASSERT_EQ(Source.ehFrameReferences().size(), 1U);
+  auto &References =
+      const_cast<std::vector<EHFrameReference> &>(Source.ehFrameReferences());
+  References.front().Offset = 8;
+  const auto Before = Source.sections().back().Content;
+  EXPECT_FALSE(normalizeMachOEHFrame(Source));
+  EXPECT_EQ(Source.sections().back().Content, Before);
+
+  auto WrongSection = makeCompactUnwindGraph(Target::AArch64, 0x02000000);
+  ASSERT_TRUE(compactUnwindToEHFrame(WrongSection));
+  auto &WrongReferences = const_cast<std::vector<EHFrameReference> &>(
+      WrongSection.ehFrameReferences());
+  WrongReferences.front().Section = 0;
+  EXPECT_FALSE(normalizeMachOEHFrame(WrongSection));
+}
+
+TEST(ObjectReaderTest, ParsesPairedAArch64MachOEHFrameReference) {
+  const auto Bytes = makeAArch64MachOEHFrameObject();
+  auto Graph =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  ASSERT_EQ(Graph->ehFrameReferences().size(), 1U);
+  const auto &Reference = Graph->ehFrameReferences().front();
+  auto Fields = machOEHFrameFields(Graph->sections()[Reference.Section].Content,
+                                   Target::AArch64);
+  ASSERT_TRUE(Fields);
+  EXPECT_EQ(*Fields, (std::set<size_t>{Reference.Offset}));
+  EXPECT_EQ(Graph->sections()[Reference.Section].Purpose,
+            SectionPurpose::EHFrame);
+  EXPECT_EQ(Graph->symbols()[Reference.Symbol].Name, "_f0");
+  EXPECT_TRUE(std::none_of(
+      Graph->relocations().begin(), Graph->relocations().end(),
+      [&](const auto &Value) { return Value.Section == Reference.Section; }));
+}
+
+TEST(ObjectReaderTest, RejectsMalformedAArch64MachOEHFramePairs) {
+  const auto Original = makeAArch64MachOEHFrameObject();
+  const auto Object = machOEHFrameObject(Original);
+  ASSERT_EQ(Object.Relocations.size(), 2U);
+  const auto Reject = [](std::vector<WasmEdge::Byte> Bytes,
+                         std::string_view Message) {
+    std::string Diagnostic;
+    WasmEdge::Log::setLoggingCallback(
+        [&](const spdlog::details::log_msg &Value) {
+          Diagnostic.assign(Value.payload.data(), Value.payload.size());
+        });
+    WasmEdge::Log::setErrorLoggingLevel();
+    auto Result = ObjectReader::read(Bytes, Target::AArch64,
+                                     ObjectReaderPolicy::Universal);
+    WasmEdge::Log::setLoggingCallback(nullptr);
+    ASSERT_FALSE(Result);
+    EXPECT_NE(Diagnostic.find(Message), std::string::npos) << Diagnostic;
+  };
+  const auto SetType = [](std::vector<WasmEdge::Byte> &Bytes, size_t Offset,
+                          uint32_t Type) {
+    auto Word = read32le(Bytes, Offset + 4);
+    write32le(Bytes, Offset + 4, (Word & UINT32_C(0x0FFFFFFF)) | (Type << 28));
+  };
+
+  auto OrphanSubtractor = Original;
+  SetType(OrphanSubtractor, Object.Relocations[1],
+          llvm::MachO::ARM64_RELOC_SUBTRACTOR);
+  Reject(std::move(OrphanSubtractor), "subtractor is not followed by unsigned");
+
+  auto OrphanUnsigned = Original;
+  SetType(OrphanUnsigned, Object.Relocations[0],
+          llvm::MachO::ARM64_RELOC_UNSIGNED);
+  Reject(std::move(OrphanUnsigned), "unsigned relocation lacks subtractor");
+
+  auto WrongOrder = Original;
+  SetType(WrongOrder, Object.Relocations[0], llvm::MachO::ARM64_RELOC_UNSIGNED);
+  SetType(WrongOrder, Object.Relocations[1],
+          llvm::MachO::ARM64_RELOC_SUBTRACTOR);
+  Reject(std::move(WrongOrder), "unsigned relocation lacks subtractor");
+
+  auto MismatchedOffset = Original;
+  write32le(MismatchedOffset, Object.Relocations[1], 25);
+  Reject(std::move(MismatchedOffset), "pair addresses differ");
+
+  auto UnsupportedSymbol = Original;
+  auto SubtractorWord = read32le(UnsupportedSymbol, Object.Relocations[0] + 4);
+  auto UnsignedWord = read32le(UnsupportedSymbol, Object.Relocations[1] + 4);
+  write32le(UnsupportedSymbol, Object.Relocations[0] + 4,
+            (SubtractorWord & UINT32_C(0xFF000000)) |
+                (UnsignedWord & UINT32_C(0x00FFFFFF)));
+  Reject(std::move(UnsupportedSymbol), "subtractor symbol");
+
+  auto NonFDEField = Original;
+  write32le(NonFDEField, Object.Relocations[0], 8);
+  write32le(NonFDEField, Object.Relocations[1], 8);
+  Reject(std::move(NonFDEField), "not an FDE initial-location field");
+}
+
+TEST(ObjectReaderTest, PreservesX86MachOEHFrameRelocation) {
+  constexpr std::string_view Frame = R"(
+.section __TEXT,__eh_frame,coalesced,no_toc+strip_static_syms+live_support
+.quad _f0
+.text
+)";
+  const auto Bytes =
+      makeObject(llvm::Triple("x86_64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, false, false, false, false, false,
+                 false, std::string(Frame));
+  auto Graph =
+      ObjectReader::read(Bytes, Target::X86_64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  EXPECT_TRUE(std::any_of(Graph->relocations().begin(),
+                          Graph->relocations().end(), [&](const auto &Value) {
+                            return Graph->sections()[Value.Section].Purpose ==
+                                       SectionPurpose::EHFrame &&
+                                   Value.Type ==
+                                       llvm::MachO::X86_64_RELOC_UNSIGNED;
+                          }));
+  EXPECT_TRUE(Graph->ehFrameReferences().empty());
+}
+
+TEST(ObjectReaderTest, ParsesCompactOnlyAArch64MachOUnwind) {
   const auto CompactOnly =
       makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
                  false, false, "generic", {}, true);
-  EXPECT_TRUE(ObjectReader::read(CompactOnly, Target::AArch64));
-  EXPECT_FALSE(ObjectReader::read(CompactOnly, Target::AArch64,
+  auto Graph = ObjectReader::read(CompactOnly, Target::AArch64,
+                                  ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  ASSERT_EQ(Graph->compactUnwind().size(), 1U);
+  const auto &Record = Graph->compactUnwind()[0];
+  EXPECT_EQ(Graph->symbols()[Record.Function].Name, "_f0");
+  EXPECT_GT(Record.Length, 0U);
+  EXPECT_EQ(Record.Encoding, 0x02000000U);
+  EXPECT_FALSE(Record.Personality);
+  EXPECT_FALSE(Record.LSDA);
+  EXPECT_FALSE(Record.FDE);
+  EXPECT_TRUE(std::none_of(Graph->sections().begin(), Graph->sections().end(),
+                           [](const Section &Value) {
+                             return Value.Purpose ==
+                                    SectionPurpose::CompactUnwind;
+                           }));
+}
+
+TEST(ObjectReaderTest, ParsesCompactUnwindUnderBothPolicies) {
+  const auto Bytes =
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, true);
+  auto Default =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Default);
+  auto Universal =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Default);
+  ASSERT_TRUE(Universal);
+  EXPECT_EQ(Default->compactUnwind().size(), Universal->compactUnwind().size());
+}
+
+TEST(ObjectReaderTest, ResolvesCompactUnwindTargetOffsets) {
+  auto Local =
+      Internal::resolveCompactUnwindTargetOffset(false, 0x1000, 0, 0x1018);
+  auto ExternalNegative = Internal::resolveCompactUnwindTargetOffset(
+      true, 0x1000, 0x20, UINT64_MAX - 7);
+  ASSERT_TRUE(Local);
+  ASSERT_TRUE(ExternalNegative);
+  EXPECT_EQ(*Local, 0x18U);
+  EXPECT_EQ(*ExternalNegative, 0x18U);
+  EXPECT_FALSE(
+      Internal::resolveCompactUnwindTargetOffset(false, 0x1000, 0, 0x0FFF));
+  EXPECT_FALSE(Internal::resolveCompactUnwindTargetOffset(
+      true, 0, UINT64_MAX, static_cast<uint64_t>(INT64_MAX)));
+}
+
+TEST(ObjectReaderTest, ValidatesDecodedCompactUnwindForBothMachOTargets) {
+  std::vector<WasmEdge::Byte> Content(32);
+  write32le(Content, 8, 8);
+  write32le(Content, 12, 0x02000000);
+  const std::array<Internal::CompactUnwindRelocation, 1> AArch64{
+      {{0, llvm::MachO::ARM64_RELOC_UNSIGNED, 8, false, false, false}}};
+  const std::array<Internal::CompactUnwindRelocation, 1> X86_64{
+      {{0, llvm::MachO::X86_64_RELOC_UNSIGNED, 8, false, false, false}}};
+  auto ARMRecords =
+      Internal::parseCompactUnwindSection(Target::AArch64, Content, AArch64);
+  auto X86Records =
+      Internal::parseCompactUnwindSection(Target::X86_64, Content, X86_64);
+  ASSERT_TRUE(ARMRecords);
+  ASSERT_TRUE(X86Records);
+  ASSERT_EQ(ARMRecords->size(), 1U);
+  ASSERT_EQ(X86Records->size(), 1U);
+  EXPECT_EQ((*ARMRecords)[0].Length, 8U);
+  EXPECT_EQ((*X86Records)[0].Encoding, 0x02000000U);
+  EXPECT_FALSE(
+      Internal::parseCompactUnwindSection(Target::ARM, Content, AArch64));
+}
+
+TEST(ObjectReaderTest, DiagnosesMalformedDecodedCompactUnwind) {
+  std::vector<WasmEdge::Byte> Content(32);
+  write32le(Content, 8, 8);
+  const auto Diagnose = [&](Internal::CompactUnwindRelocation Relocation) {
+    auto Result = Internal::parseCompactUnwindSection(
+        Target::AArch64, Content,
+        WasmEdge::Span<const Internal::CompactUnwindRelocation>(&Relocation,
+                                                                1));
+    EXPECT_FALSE(Result);
+    return Result.error().Message;
+  };
+  EXPECT_EQ(
+      Diagnose({8, llvm::MachO::ARM64_RELOC_UNSIGNED, 8, false, false, false}),
+      "unsupported compact unwind relocation field");
+  EXPECT_EQ(
+      Diagnose({0, llvm::MachO::ARM64_RELOC_UNSIGNED, 4, false, false, false}),
+      "unsupported compact unwind relocation");
+  auto Missing =
+      Internal::parseCompactUnwindSection(Target::AArch64, Content, {});
+  ASSERT_FALSE(Missing);
+  EXPECT_EQ(Missing.error().Message,
+            "compact unwind record lacks function relocation");
+  write64le(Content, 16, 1);
+  std::array<Internal::CompactUnwindRelocation, 1> Function{
+      {{0, llvm::MachO::ARM64_RELOC_UNSIGNED, 8, false, false, false}}};
+  auto Unrelocated =
+      Internal::parseCompactUnwindSection(Target::AArch64, Content, Function);
+  ASSERT_FALSE(Unrelocated);
+  EXPECT_EQ(Unrelocated.error().Message,
+            "compact unwind target lacks relocation");
+}
+
+TEST(ObjectReaderTest, AssociatesZeroDwarfInputByFunctionFDE) {
+  auto Mixed =
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, true, true, false, false, true);
+  clearMachOSectionRelocations(Mixed, "__text");
+  const auto Offsets = compactUnwindObjectOffsets(Mixed);
+  ASSERT_NE(Offsets.Content, 0U);
+  EXPECT_EQ(read32le(Mixed, Offsets.Content + 12), UINT32_C(0x03000000));
+  const auto FDEOffsets = ehFrameFDEOffsets(Mixed);
+  ASSERT_FALSE(FDEOffsets.empty());
+  EXPECT_GT(FDEOffsets.front(), 0U);
+  auto Graph =
+      ObjectReader::read(Mixed, Target::AArch64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  ASSERT_TRUE(Graph->compactUnwind()[0].FDE);
+  EXPECT_GT(Graph->symbols()[*Graph->compactUnwind()[0].FDE].Offset, 0U);
+}
+
+TEST(ObjectReaderTest, AssociatesExactNonzeroDwarfOffset) {
+  auto Mixed =
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, true, true, false, false, true);
+  clearMachOSectionRelocations(Mixed, "__text");
+  const auto Offsets = compactUnwindObjectOffsets(Mixed);
+  ASSERT_NE(Offsets.Content, 0U);
+  std::optional<LinkGraph> Graph;
+  uint32_t FDEOffset = 0;
+  for (const uint32_t Candidate : ehFrameFDEOffsets(Mixed)) {
+    auto CandidateObject = Mixed;
+    write32le(CandidateObject, Offsets.Content + 12,
+              UINT32_C(0x03000000) | Candidate);
+    auto Parsed = ObjectReader::read(CandidateObject, Target::AArch64,
+                                     ObjectReaderPolicy::Universal);
+    if (!Parsed)
+      continue;
+    ASSERT_FALSE(Graph);
+    FDEOffset = Candidate;
+    Graph.emplace(std::move(*Parsed));
+  }
+  ASSERT_TRUE(Graph);
+  ASSERT_TRUE(Graph->compactUnwind()[0].FDE);
+  EXPECT_EQ(Graph->symbols()[*Graph->compactUnwind()[0].FDE].Offset, FDEOffset);
+  EXPECT_TRUE(compactUnwindToEHFrame(*Graph));
+}
+
+TEST(CompactUnwindTest, ConvertsSparseX86RBPRegisterSlots) {
+  auto Graph = makeCompactUnwindGraph(Target::X86_64, 0x01040081);
+  ASSERT_TRUE(compactUnwindToEHFrame(Graph));
+  const auto EH =
+      std::find_if(Graph.sections().begin(), Graph.sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::EHFrame;
+                   });
+  ASSERT_NE(EH, Graph.sections().end());
+  const std::vector<WasmEdge::Byte> CFI{0x83, 6, 0x8C, 4};
+  EXPECT_NE(std::search(EH->Content.begin(), EH->Content.end(), CFI.begin(),
+                        CFI.end()),
+            EH->Content.end());
+}
+
+TEST(CompactUnwindTest, ConvertsAArch64FramePairs) {
+  auto Graph = makeCompactUnwindGraph(Target::AArch64, 0x04000303);
+  ASSERT_TRUE(compactUnwindToEHFrame(Graph));
+  const auto &Bytes = Graph.sections().back().Content;
+  const std::vector<WasmEdge::Byte> CFI{
+      0x0C, 29,   16, 0x9E, 1,    0x9D, 2, 0x93, 3,  0x94, 4,    0x95, 5, 0x96,
+      6,    0x05, 72, 7,    0x05, 73,   8, 0x05, 74, 9,    0x05, 75,   10};
+  EXPECT_NE(std::search(Bytes.begin(), Bytes.end(), CFI.begin(), CFI.end()),
+            Bytes.end());
+}
+
+TEST(CompactUnwindTest, ConvertsAArch64FramelessPairs) {
+  const auto DecodeRules = [](WasmEdge::Span<const WasmEdge::Byte> Bytes,
+                              uint64_t StackSize) {
+    std::map<uint32_t, int64_t> Rules;
+    std::vector<WasmEdge::Byte> Prefix{0x0C, 31};
+    uint64_t Value = StackSize;
+    do {
+      WasmEdge::Byte Part = static_cast<WasmEdge::Byte>(Value & 0x7F);
+      Value >>= 7;
+      Prefix.push_back(Part | (Value == 0 ? 0 : 0x80));
+    } while (Value != 0);
+    Prefix.insert(Prefix.end(), {0x08, 30});
+    auto Cursor =
+        std::search(Bytes.begin(), Bytes.end(), Prefix.begin(), Prefix.end());
+    EXPECT_NE(Cursor, Bytes.end());
+    if (Cursor == Bytes.end())
+      return Rules;
+    Cursor += static_cast<ptrdiff_t>(Prefix.size());
+    while (Cursor != Bytes.end()) {
+      uint32_t Register = 0;
+      if ((*Cursor & 0xC0) == 0x80) {
+        Register = *Cursor++ & 0x3F;
+      } else if (*Cursor++ == 0x05 && Cursor != Bytes.end()) {
+        Register = *Cursor++;
+      } else {
+        break;
+      }
+      if (Cursor == Bytes.end())
+        break;
+      const uint64_t Factor = *Cursor++;
+      Rules.emplace(Register, -8 * static_cast<int64_t>(Factor));
+    }
+    return Rules;
+  };
+  for (const auto &[Encoding, Expected] :
+       std::array<std::pair<uint32_t, std::map<uint32_t, int64_t>>, 2>{
+           {{{0x0200400F},
+             {{19, 0},
+              {20, -8},
+              {21, -16},
+              {22, -24},
+              {23, -32},
+              {24, -40},
+              {25, -48},
+              {26, -56}}},
+            {{0x02021010}, {{27, 0}, {28, -8}}}}}) {
+    auto Graph = makeCompactUnwindGraph(Target::AArch64, Encoding);
+    ASSERT_TRUE(compactUnwindToEHFrame(Graph));
+    const auto &Bytes = Graph.sections().back().Content;
+    EXPECT_EQ(DecodeRules(Bytes, ((Encoding >> 12) & 0xFFF) * 16), Expected);
+  }
+  auto Reserved = makeCompactUnwindGraph(Target::AArch64, 0x02001020);
+  EXPECT_FALSE(validateCompactUnwind(Reserved));
+}
+
+TEST(CompactUnwindTest, PreservesNotFunctionStartFlag) {
+  for (const auto &[Architecture, Encoding] :
+       std::array<std::pair<Target, uint32_t>, 2>{
+           {{Target::AArch64, 0x82000000}, {Target::X86_64, 0x82020000}}}) {
+    auto Graph = makeCompactUnwindGraph(Architecture, Encoding);
+    ASSERT_TRUE(validateCompactUnwind(Graph));
+    ASSERT_TRUE(reserveMachOUnwindInfo(Graph));
+    ASSERT_TRUE(layout(Graph, 0, 0x4000));
+    ASSERT_TRUE(applyRelocations(Graph));
+    ASSERT_TRUE(populateMachOUnwindInfo(Graph));
+    const auto Unwind = std::find_if(
+        Graph.sections().begin(), Graph.sections().end(),
+        [](const auto &S) { return S.Purpose == SectionPurpose::UnwindInfo; });
+    ASSERT_NE(Unwind, Graph.sections().end());
+    const std::array<WasmEdge::Byte, 4> Encoded{
+        0, 0,
+        Architecture == Target::X86_64 ? WasmEdge::Byte{2} : WasmEdge::Byte{0},
+        0x82};
+    EXPECT_NE(std::search(Unwind->Content.begin(), Unwind->Content.end(),
+                          Encoded.begin(), Encoded.end()),
+              Unwind->Content.end());
+  }
+}
+
+TEST(CompactUnwindTest, ConvertsX86FramelessModes) {
+  auto Immediate = makeCompactUnwindGraph(Target::X86_64, 0x02360804);
+  ASSERT_TRUE(compactUnwindToEHFrame(Immediate));
+  const std::vector<WasmEdge::Byte> ImmediateCFI{0x0C, 7,    0xB0, 3,    0x90,
+                                                 1,    0x86, 2,    0x83, 3};
+  EXPECT_NE(std::search(Immediate.sections().back().Content.begin(),
+                        Immediate.sections().back().Content.end(),
+                        ImmediateCFI.begin(), ImmediateCFI.end()),
+            Immediate.sections().back().Content.end());
+
+  auto Indirect = makeCompactUnwindGraph(Target::X86_64, 0x03056804);
+  const std::array<WasmEdge::Byte, 5> Text{0x48, 0x81, 0xEC, 0x48, 0x38};
+  ASSERT_TRUE(Indirect.writeSectionContent(0, 2, Text));
+  ASSERT_TRUE(compactUnwindToEHFrame(Indirect));
+}
+
+TEST(CompactUnwindTest, ValidatesAllDocumentedModesEarly) {
+  for (const auto &[TargetValue, Encoding] :
+       std::array<std::pair<Target, uint32_t>, 4>{
+           {{Target::AArch64, 0x04000F1F},
+            {Target::AArch64, 0x02001001},
+            {Target::X86_64, 0x02001C00},
+            {Target::X86_64, 0x03056804}}}) {
+    auto Graph = makeCompactUnwindGraph(TargetValue, Encoding);
+    EXPECT_EQ(static_cast<bool>(validateCompactUnwind(Graph)),
+              Encoding == 0x04000F1F || Encoding == 0x02001001);
+  }
+}
+
+TEST(CompactUnwindTest, RejectsMalformedFramelessEncodings) {
+  for (const uint32_t Encoding :
+       {UINT32_C(0x02001C00), UINT32_C(0x02000406), UINT32_C(0x03056804)}) {
+    auto Graph = makeCompactUnwindGraph(Target::X86_64, Encoding);
+    EXPECT_FALSE(validateCompactUnwind(Graph));
+    EXPECT_EQ(Graph.sections().size(), 1U);
+  }
+  auto Truncated = makeCompactUnwindGraph(Target::X86_64, 0x030E6804);
+  EXPECT_FALSE(validateCompactUnwind(Truncated));
+  auto Reserved = makeCompactUnwindGraph(Target::AArch64, 0x02001020);
+  EXPECT_FALSE(validateCompactUnwind(Reserved));
+}
+
+TEST(CompactUnwindTest, AcceptsX86DwarfFallbackRelocationAssociation) {
+  auto Existing = makeCompactUnwindGraph(Target::X86_64, 0x01000000);
+  ASSERT_TRUE(compactUnwindToEHFrame(Existing));
+  const auto EH =
+      std::find_if(Existing.sections().begin(), Existing.sections().end(),
+                   [](const auto &Section) {
+                     return Section.Purpose == SectionPurpose::EHFrame;
+                   });
+  ASSERT_NE(EH, Existing.sections().end());
+
+  LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::MachO);
+  ASSERT_TRUE(Graph.beginInput("x86-dwarf.o"));
+  auto Text = Graph.addSection(Section{"__text", SectionKind::Text, 1, 16, 0, 0,
+                                       std::vector<WasmEdge::Byte>(16)});
+  auto Frame = Graph.addSection(*EH);
+  ASSERT_TRUE(Text && Frame);
+  auto Function = Graph.addSymbol(Symbol{"_f0", *Text, 0, 16, true, {}, true});
+  auto FDE = Graph.addSymbol(Symbol{"fde", *Frame, 16, 0, false});
+  ASSERT_TRUE(Function && FDE);
+  ASSERT_TRUE(Graph.addRelocation(
+      Relocation{*Frame, 24, llvm::MachO::X86_64_RELOC_UNSIGNED, *Function, 0,
+                 false, ObjectFormat::MachO, 8, false, true, false}));
+  ASSERT_TRUE(Graph.addCompactUnwind(
+      CompactUnwindRecord{*Function, 16, 0x04000000, {}, {}, *FDE}));
+  EXPECT_TRUE(compactUnwindToEHFrame(Graph));
+}
+
+TEST(CompactUnwindTest, RejectsX86DwarfFallbackWithoutExactAssociation) {
+  auto Graph = makeCompactUnwindGraph(Target::X86_64, 0x04000000);
+  const auto Sections = Graph.sections();
+  EXPECT_FALSE(compactUnwindToEHFrame(Graph));
+  EXPECT_EQ(Graph.sections().size(), Sections.size());
+  EXPECT_EQ(Graph.sections().front().Content, Sections.front().Content);
+}
+
+TEST(ObjectReaderTest, RejectsWrongDwarfCompactUnwindOffset) {
+  auto Bytes =
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, true, true, false, false, true);
+  const auto Offsets = compactUnwindObjectOffsets(Bytes);
+  ASSERT_NE(Offsets.Content, 0U);
+  EXPECT_EQ(read32le(Bytes, Offsets.Content + 12) & UINT32_C(0x0F000000),
+            UINT32_C(0x03000000));
+  write32le(Bytes, Offsets.Content + 12, UINT32_C(0x03000001));
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::AArch64,
                                   ObjectReaderPolicy::Universal));
+}
+
+TEST(ObjectReaderTest, LeavesX86_64MachOEHOnlyUnchanged) {
+  const auto EHOnly =
+      makeObject(llvm::Triple("x86_64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, true);
+  auto Graph =
+      ObjectReader::read(EHOnly, Target::X86_64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  EXPECT_TRUE(Graph->compactUnwind().empty());
+  EXPECT_TRUE(std::any_of(Graph->sections().begin(), Graph->sections().end(),
+                          [](const Section &Value) {
+                            return Value.Purpose == SectionPurpose::EHFrame;
+                          }));
+}
+
+TEST(ObjectReaderTest, ParsesAssembledX86_64MachOCompactUnwind) {
+  constexpr std::string_view CompactUnwind = R"(
+.section __LD,__compact_unwind,regular,debug
+.p2align 3
+.quad _f0
+.long 1
+.long 0x01000000
+.quad 0
+.quad 0
+)";
+  const auto Bytes =
+      makeObject(llvm::Triple("x86_64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, false, false, false, false, false,
+                 false, std::string(CompactUnwind));
+  auto Graph =
+      ObjectReader::read(Bytes, Target::X86_64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  ASSERT_EQ(Graph->compactUnwind().size(), 1U);
+  const auto &Record = Graph->compactUnwind()[0];
+  EXPECT_EQ(Graph->symbols()[Record.Function].Name, "_f0");
+  EXPECT_EQ(Record.Length, 1U);
+  EXPECT_EQ(Record.Encoding, 0x01000000U);
+  EXPECT_FALSE(Record.Personality);
+  EXPECT_FALSE(Record.LSDA);
+}
+
+TEST(ObjectReaderTest, RejectsMalformedAArch64MachOCompactUnwind) {
+  const auto MakeCompact = [] {
+    return makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0",
+                      {}, false, false, "generic", {}, true);
+  };
+  const auto Reject = [](std::vector<WasmEdge::Byte> Bytes,
+                         std::string_view Message) {
+    std::string Diagnostic;
+    WasmEdge::Log::setLoggingCallback(
+        [&](const spdlog::details::log_msg &Value) {
+          Diagnostic.assign(Value.payload.data(), Value.payload.size());
+        });
+    WasmEdge::Log::setErrorLoggingLevel();
+    auto Result = ObjectReader::read(Bytes, Target::AArch64,
+                                     ObjectReaderPolicy::Universal);
+    WasmEdge::Log::setLoggingCallback(nullptr);
+    ASSERT_FALSE(Result);
+    EXPECT_NE(Diagnostic.find(Message), std::string::npos) << Diagnostic;
+  };
+
+  constexpr std::string_view BadSizeAssembly = R"(
+.section __LD,__compact_unwind,regular,debug
+.space 31
+)";
+  auto BadSize =
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, false, false, false, false, false,
+                 false, std::string(BadSizeAssembly));
+  Reject(std::move(BadSize), "compact unwind size is not a multiple of 32");
+
+  auto MissingFunction = MakeCompact();
+  auto Offsets = compactUnwindObjectOffsets(MissingFunction);
+  const auto FunctionRelocation =
+      compactUnwindRelocationFileOffset(MissingFunction, 0);
+  ASSERT_NE(FunctionRelocation, 0U);
+  write32le(MissingFunction, FunctionRelocation, 16);
+  Reject(std::move(MissingFunction),
+         "compact unwind record lacks function relocation");
+
+  auto UnsupportedField = MakeCompact();
+  Offsets = compactUnwindObjectOffsets(UnsupportedField);
+  const auto UnsupportedRelocation =
+      compactUnwindRelocationFileOffset(UnsupportedField, 0);
+  ASSERT_NE(UnsupportedRelocation, 0U);
+  write32le(UnsupportedField, UnsupportedRelocation, 8);
+  Reject(std::move(UnsupportedField),
+         "unsupported compact unwind relocation field");
+
+  auto ZeroLength = MakeCompact();
+  Offsets = compactUnwindObjectOffsets(ZeroLength);
+  write32le(ZeroLength, Offsets.Content + 8, 0);
+  Reject(std::move(ZeroLength),
+         "compact unwind function length must be non-zero");
+
+  auto BadTarget = MakeCompact();
+  Offsets = compactUnwindObjectOffsets(BadTarget);
+  write64le(BadTarget, Offsets.Content, UINT64_MAX);
+  Reject(std::move(BadTarget), "compact unwind target is outside its section");
+
+  for (const size_t Field : {16U, 24U}) {
+    auto UnrelocatedTarget = MakeCompact();
+    Offsets = compactUnwindObjectOffsets(UnrelocatedTarget);
+    write64le(UnrelocatedTarget, Offsets.Content + Field, 1);
+    Reject(std::move(UnrelocatedTarget),
+           "compact unwind target lacks relocation");
+  }
+}
+
+TEST(ObjectReaderTest, RejectsDuplicateAArch64MachOCompactUnwindRelocation) {
+  auto Bytes = makeObject(llvm::Triple("arm64-apple-macosx"), false, false,
+                          "f0", {}, false, false, "generic", {}, true, false,
+                          false, false, false, false, {}, false, true);
+  const auto Offsets = compactUnwindObjectOffsets(Bytes);
+  ASSERT_GE(Offsets.Count, 2U);
+  const auto SecondFunctionRelocation =
+      compactUnwindRelocationFileOffset(Bytes, 32);
+  ASSERT_NE(SecondFunctionRelocation, 0U);
+  write32le(Bytes, SecondFunctionRelocation, 0);
+  std::string Diagnostic;
+  WasmEdge::Log::setLoggingCallback([&](const spdlog::details::log_msg &Value) {
+    Diagnostic.assign(Value.payload.data(), Value.payload.size());
+  });
+  WasmEdge::Log::setErrorLoggingLevel();
+  auto Result =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
+  WasmEdge::Log::setLoggingCallback(nullptr);
+  ASSERT_FALSE(Result);
+  EXPECT_NE(Diagnostic.find("duplicate compact unwind relocation field"),
+            std::string::npos)
+      << Diagnostic;
 }
 
 TEST(RelocationTest, RejectsPortablePersonalityObjects) {
@@ -4922,6 +6485,46 @@ TEST(ObjectReaderTest, ExportsMachOExternalDefinedSymbols) {
   EXPECT_EQ(Result->relocations()[0].PatchSize, 4U);
   EXPECT_TRUE(Result->relocations()[0].External);
   EXPECT_FALSE(Result->relocations()[0].Scattered);
+}
+
+TEST(ObjectReaderTest, RejectsArm64eMachOSubtypes) {
+  constexpr size_t MachOCPUSubtypeOffset = 8;
+  constexpr uint32_t CPU_SUBTYPE_ARM64_ALL = 0;
+  constexpr uint32_t CPU_SUBTYPE_ARM64E = 2;
+  constexpr uint32_t CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_1 = 0x81000002;
+  constexpr uint32_t CPU_SUBTYPE_LIB64 = 0x80000000;
+  const auto Generic = makeObject(llvm::Triple("arm64-apple-macosx"));
+  ASSERT_EQ(read32le(Generic, MachOCPUSubtypeOffset), CPU_SUBTYPE_ARM64_ALL);
+  for (const auto Policy : {ObjectReaderPolicy::Default,
+                            ObjectReaderPolicy::Universal}) {
+    EXPECT_TRUE(ObjectReader::read(Generic, Target::AArch64, Policy));
+    auto GenericWithCapabilities = Generic;
+    write32le(GenericWithCapabilities, MachOCPUSubtypeOffset,
+              CPU_SUBTYPE_LIB64 | CPU_SUBTYPE_ARM64_ALL);
+    EXPECT_TRUE(ObjectReader::read(GenericWithCapabilities, Target::AArch64,
+                                   Policy));
+    for (const uint32_t Subtype : {CPU_SUBTYPE_ARM64E,
+                                   CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_1,
+                                   CPU_SUBTYPE_LIB64 | CPU_SUBTYPE_ARM64E}) {
+      auto Arm64e = Generic;
+      write32le(Arm64e, MachOCPUSubtypeOffset, Subtype);
+      std::string Diagnostic;
+      WasmEdge::Log::setLoggingCallback(
+          [&](const spdlog::details::log_msg &Value) {
+            Diagnostic.assign(Value.payload.data(), Value.payload.size());
+          });
+      WasmEdge::Log::setErrorLoggingLevel();
+      auto Result = ObjectReader::read(Arm64e, Target::AArch64, Policy);
+      WasmEdge::Log::setLoggingCallback(nullptr);
+      EXPECT_FALSE(Result);
+      EXPECT_NE(Diagnostic.find("including arm64e"),
+                std::string::npos)
+          << Diagnostic;
+    }
+  }
+
+  const auto X86 = makeObject(llvm::Triple("x86_64-apple-macosx"));
+  EXPECT_TRUE(ObjectReader::read(X86, Target::X86_64));
 }
 
 TEST(ObjectReaderTest, RejectsMalformedX86_64MachOSignedMetadata) {
