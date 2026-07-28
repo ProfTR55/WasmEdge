@@ -216,12 +216,21 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
     const uint64_t P = PatchSection.Address + RelocationValue.Offset;
     int64_t Addend = RelocationValue.Addend;
     if (RelocationValue.AddendIsImplicit) {
-      auto Decoded =
-          readSigned(Bytes, RelocationValue.Offset, Width, Graph.endianness());
-      if (!Decoded) {
-        return fail(RelocationValue, "cannot decode implicit addend");
+      if (ImageRelative) {
+        auto Decoded = readUnsigned(Bytes, RelocationValue.Offset, Width,
+                                    Graph.endianness());
+        if (!Decoded || *Decoded > INT64_MAX) {
+          return fail(RelocationValue, "cannot decode implicit addend");
+        }
+        Addend = static_cast<int64_t>(*Decoded);
+      } else {
+        auto Decoded = readSigned(Bytes, RelocationValue.Offset, Width,
+                                  Graph.endianness());
+        if (!Decoded) {
+          return fail(RelocationValue, "cannot decode implicit addend");
+        }
+        Addend = *Decoded;
       }
-      Addend = *Decoded;
     }
     if ((FormatAdjustment < 0 &&
          Addend < std::numeric_limits<int64_t>::min() - FormatAdjustment) ||

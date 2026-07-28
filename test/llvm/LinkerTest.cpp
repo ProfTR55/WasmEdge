@@ -37,6 +37,10 @@
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/Config/llvm-config.h>
 
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable : 4267)
+#endif
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/Function.h>
@@ -65,6 +69,9 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
 
 #include <algorithm>
 #include <array>
@@ -4728,6 +4735,24 @@ TEST(RelocationTest, RecognizesObservedPortablePatchWidthsAndPCRelativeForms) {
     EXPECT_EQ(relocationIsPCRelative(Test.Format, Test.Architecture, Test.Type),
               Test.PCRelative);
   }
+}
+
+TEST(RelocationTest, DecodesCOFFAddr32NBImplicitAddendAsUnsigned) {
+  constexpr uint64_t ImageBase = UINT64_C(0x180000000);
+  constexpr uint32_t Addend = UINT32_C(0x80000000);
+  auto Graph = makeRelocationGraph(llvm::COFF::IMAGE_REL_AMD64_ADDR32NB, 0,
+                                   true, ImageBase + 0x2000, ImageBase + 0x1000,
+                                   ObjectFormat::COFF);
+  auto Content = Graph.sectionContent(0);
+  ASSERT_TRUE(Content);
+  std::array<WasmEdge::Byte, 4> Bytes{};
+  std::memcpy(Bytes.data(), &Addend, sizeof(Addend));
+  ASSERT_TRUE(Graph.writeSectionContent(0, 1, Bytes));
+  ASSERT_TRUE(applyRelocations(Graph));
+  auto Value = Internal::readUnsigned(Graph.sections()[0].Content, 1, 4,
+                                      Endianness::Little);
+  ASSERT_TRUE(Value);
+  EXPECT_EQ(*Value, static_cast<uint64_t>(Addend) + 0x2000);
 }
 
 TEST(RelocationTest, AcceptsMachOAbsoluteAndRejectsGOTForms) {
