@@ -267,7 +267,8 @@ findSection(const llvm::object::ObjectFile &Object, std::string_view Wanted,
 
 uint32_t elfHash(std::string_view Name) {
   uint32_t Result = 0;
-  for (const unsigned char Character : Name) {
+  for (const char Value : Name) {
+    const auto Character = static_cast<unsigned char>(Value);
     Result = (Result << 4) + Character;
     const uint32_t High = Result & UINT32_C(0xF0000000);
     if (High != 0)
@@ -977,13 +978,14 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
     EXPECT_EQ(readInteger(HeaderBytes, 8, 4, Test.Endian), 2U);
     uint64_t Previous = 0;
     for (size_t I = 0; I < 2; ++I) {
-      const uint64_t FunctionAddress =
-          HeaderSection->getAddress() +
-          static_cast<int32_t>(
-              readInteger(HeaderBytes, 12 + I * 8, 4, Test.Endian));
-      const uint64_t FDEAddress = HeaderSection->getAddress() +
-                                  static_cast<int32_t>(readInteger(
-                                      HeaderBytes, 16 + I * 8, 4, Test.Endian));
+      const auto HeaderAddress =
+          static_cast<int64_t>(HeaderSection->getAddress());
+      const uint64_t FunctionAddress = static_cast<uint64_t>(
+          HeaderAddress + static_cast<int32_t>(readInteger(
+                              HeaderBytes, 12 + I * 8, 4, Test.Endian)));
+      const uint64_t FDEAddress = static_cast<uint64_t>(
+          HeaderAddress + static_cast<int32_t>(readInteger(
+                              HeaderBytes, 16 + I * 8, 4, Test.Endian)));
       EXPECT_EQ(FunctionAddress, Graph.sections()[0].Address + I * 2);
       EXPECT_EQ(FDEAddress, Graph.sections()[2].Address + 17 + I * 17);
       if (I != 0) {
@@ -2200,8 +2202,9 @@ TEST(MachOWriterTest, WritesDeterministicDylibsForMacOSTargets) {
                                                        Endianness::Little));
     size_t RebaseCursor = RebaseOffset;
     ASSERT_LT(RebaseCursor, RebaseEnd);
-    EXPECT_EQ(Bytes[RebaseCursor++], llvm::MachO::REBASE_OPCODE_SET_TYPE_IMM |
-                                         llvm::MachO::REBASE_TYPE_POINTER);
+    EXPECT_EQ(Bytes[RebaseCursor++],
+              static_cast<uint8_t>(llvm::MachO::REBASE_OPCODE_SET_TYPE_IMM) |
+                  static_cast<uint8_t>(llvm::MachO::REBASE_TYPE_POINTER));
     std::set<uint64_t> RebasedAddresses;
     while (RebaseCursor < RebaseEnd &&
            Bytes[RebaseCursor] != llvm::MachO::REBASE_OPCODE_DONE) {

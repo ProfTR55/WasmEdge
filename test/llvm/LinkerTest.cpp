@@ -48,14 +48,6 @@
 #else
 #include <llvm/Support/TargetRegistry.h>
 #endif
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4267)
-#endif
-#include <llvm/MC/MCSection.h>
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
 #if LLVM_VERSION_MAJOR >= 19
 #include <llvm/MC/MCELFExtras.h>
 #endif
@@ -855,7 +847,7 @@ std::vector<WasmEdge::Byte> makeX86_64CrelObject() {
   llvm::raw_svector_ostream Stream(Encoded);
   llvm::ELF::encodeCrel<true>(
       Stream, Relocations, [](const auto &Relocation) { return Relocation; });
-  std::copy(Encoded.begin(), Encoded.end(), Bytes.begin() + Offset);
+  std::copy(Encoded.begin(), Encoded.end(), Bytes.data() + Offset);
   Bytes[Header + 4] = 0x14;
   Bytes[Header + 5] = 0x00;
   Bytes[Header + 6] = 0x00;
@@ -5165,10 +5157,11 @@ TEST_F(LinkerOutputTest, WritesConvertedCompactUnwindToUniversalWasm) {
     static_cast<void>(ReadULEB(Cursor));
     const uint64_t ContentSize = ReadULEB(Cursor);
     ASSERT_LE(ContentSize, Bytes.size() - Cursor);
+    const auto NativeContentSize = static_cast<size_t>(ContentSize);
     if (Kind == 4)
-      Unwind.assign(Bytes.begin() + Cursor,
-                    Bytes.begin() + Cursor + ContentSize);
-    Cursor += ContentSize;
+      Unwind.assign(Bytes.data() + Cursor,
+                    Bytes.data() + Cursor + NativeContentSize);
+    Cursor += NativeContentSize;
   }
   ASSERT_FALSE(Unwind.empty());
   EXPECT_EQ(std::vector<WasmEdge::Byte>(Unwind.end() - 4, Unwind.end()),
@@ -5642,7 +5635,9 @@ TEST(EHFrameTest, RequiresTypeWrapperCoverage) {
       const size_t Field = Offset + 8;
       int64_t Delta = 0;
       std::memcpy(&Delta, Content->data() + Field, sizeof(Delta));
-      if (Graph->sections()[EHId].Address + Field + Delta == T0Address) {
+      if (static_cast<int64_t>(Graph->sections()[EHId].Address + Field) +
+              Delta ==
+          static_cast<int64_t>(T0Address)) {
         Delta = static_cast<int64_t>(F0Address -
                                      (Graph->sections()[EHId].Address + Field));
         std::array<WasmEdge::Byte, sizeof(Delta)> Replacement{};
