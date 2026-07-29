@@ -198,6 +198,50 @@ bool expectedELFPCRelative(Target Architecture, uint32_t Type) {
   }
 }
 
+void initializeLLVMTargets() {
+  static const bool Initialized = [] {
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmPrinters();
+    llvm::InitializeAllAsmParsers();
+    return true;
+  }();
+  (void)Initialized;
+}
+
+const llvm::Target *lookupLLVMTarget(const llvm::Triple &Triple,
+                                     std::string &Error) {
+  initializeLLVMTargets();
+  llvm::Triple LookupTriple = Triple;
+  return llvm::TargetRegistry::lookupTarget("", LookupTriple, Error);
+}
+
+#define REQUIRE_LLVM_TARGET(TRIPLE)                                            \
+  do {                                                                         \
+    const llvm::Triple RequiredTriple(TRIPLE);                                 \
+    std::string TargetError;                                                   \
+    if (lookupLLVMTarget(RequiredTriple, TargetError) == nullptr) {            \
+      GTEST_SKIP() << RequiredTriple.str() << ": " << TargetError;             \
+    }                                                                          \
+  } while (false)
+
+template <typename Func>
+void withLLVMTarget(const llvm::Triple &Triple, Func &&Run) {
+  std::string Error;
+  if (lookupLLVMTarget(Triple, Error) == nullptr) {
+    GTEST_SKIP() << Triple.str() << ": " << Error;
+  }
+  Run();
+}
+
+void checkLLVMTarget(const llvm::Triple &Triple, bool &Available) {
+  std::string Error;
+  Available = lookupLLVMTarget(Triple, Error) != nullptr;
+  if (!Available) {
+    GTEST_SKIP() << Triple.str() << ": " << Error;
+  }
+}
+
 std::vector<WasmEdge::Byte> makeObject(
     const llvm::Triple &Triple, bool Undefined = false, bool DLLExport = false,
     std::string FunctionName = "f0", std::string Directives = {},
@@ -209,18 +253,8 @@ std::vector<WasmEdge::Byte> makeObject(
     bool TypeWrapper = false, bool FloatingPoint = false,
     bool DefineFltused = false, bool UnusedAllocatableSections = false,
     bool DistinctTypeWrapperUnwind = false) {
-  static const bool Initialized = [] {
-    llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs();
-    llvm::InitializeAllAsmPrinters();
-    llvm::InitializeAllAsmParsers();
-    return true;
-  }();
-  (void)Initialized;
   std::string Error;
-  llvm::Triple LookupTriple = Triple;
-  const llvm::Target *NativeTarget =
-      llvm::TargetRegistry::lookupTarget("", LookupTriple, Error);
+  const llvm::Target *NativeTarget = lookupLLVMTarget(Triple, Error);
   EXPECT_NE(NativeTarget, nullptr) << Error;
   if (NativeTarget == nullptr) {
     return {};
@@ -887,18 +921,8 @@ std::vector<WasmEdge::Byte> makeAssemblyObject(const llvm::Triple &Triple,
                                                std::string Assembly,
                                                std::string Features = {},
                                                bool HardFloat = false) {
-  static const bool Initialized = [] {
-    llvm::InitializeAllTargets();
-    llvm::InitializeAllTargetMCs();
-    llvm::InitializeAllAsmPrinters();
-    llvm::InitializeAllAsmParsers();
-    return true;
-  }();
-  (void)Initialized;
   std::string Error;
-  llvm::Triple LookupTriple = Triple;
-  const llvm::Target *Target =
-      llvm::TargetRegistry::lookupTarget("", LookupTriple, Error);
+  const llvm::Target *Target = lookupLLVMTarget(Triple, Error);
   EXPECT_NE(Target, nullptr) << Error;
   if (Target == nullptr) {
     return {};
@@ -1557,11 +1581,12 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsUnsupportedInputsAtomically) {
                          true),
   };
 #if WASMEDGE_OS_LINUX && (defined(__x86_64__) || defined(_M_X64))
-  Invalid.emplace_back(makeSemanticObject(llvm::Triple("x86_64-apple-macosx")));
-  Invalid.emplace_back(
-      makeSemanticObject(llvm::Triple("x86_64-pc-windows-msvc")));
-  Invalid.emplace_back(
-      makeSemanticObject(llvm::Triple("aarch64-unknown-linux-gnu")));
+  for (const char *Triple : {"x86_64-apple-macosx", "x86_64-pc-windows-msvc",
+                             "aarch64-unknown-linux-gnu"}) {
+    withLLVMTarget(llvm::Triple(Triple), [&] {
+      Invalid.emplace_back(makeSemanticObject(llvm::Triple(Triple)));
+    });
+  }
 #endif
   for (const auto &Object : Invalid) {
     {
@@ -1687,14 +1712,16 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsNonHostObjectFormatsAtomically) {
                                             "x86_64-apple-macosx"};
 #endif
   for (const char *Triple : Triples) {
-    const auto Object = makeObject(llvm::Triple(Triple), false, false, "f0", {},
-                                   false, false, "generic", {}, false, false,
-                                   false, false, false, false, {}, true);
-    const auto Output = Directory / (std::string(Triple) + ".wasm");
-    EXPECT_FALSE(NativeLinker::link(Object, EmptyWasm, Output,
-                                    OutputKind::UniversalWasm));
-    EXPECT_FALSE(std::filesystem::exists(Output));
-    expectNoTemporaryFiles();
+    withLLVMTarget(llvm::Triple(Triple), [&] {
+      const auto Object = makeObject(
+          llvm::Triple(Triple), false, false, "f0", {}, false, false, "generic",
+          {}, false, false, false, false, false, false, {}, true);
+      const auto Output = Directory / (std::string(Triple) + ".wasm");
+      EXPECT_FALSE(NativeLinker::link(Object, EmptyWasm, Output,
+                                      OutputKind::UniversalWasm));
+      EXPECT_FALSE(std::filesystem::exists(Output));
+      expectNoTemporaryFiles();
+    });
   }
 #endif
 }
@@ -3089,6 +3116,7 @@ TEST(RelocationTest, AppliesMachOSignedSuffixBiasExactly) {
 }
 
 TEST(RelocationTest, RelocatesGeneratedMachOSignedSuffixExactly) {
+  REQUIRE_LLVM_TARGET("x86_64-apple-macosx");
   const auto Original = makeObject(llvm::Triple("x86_64-apple-macosx"));
   auto Parsed =
       llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
@@ -3328,6 +3356,7 @@ TEST(RelocationTest, RejectsMutationAndLayoutAfterRelocation) {
 }
 
 TEST(RelocationTest, ReadsLayoutsAndRelocatesX86_64ObjectEndToEnd) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Graph = ObjectReader::read(
       makeObject(llvm::Triple("x86_64-unknown-linux-gnu")), Target::X86_64);
   ASSERT_TRUE(Graph);
@@ -3515,6 +3544,7 @@ TEST(ARMRelocationTest, RejectsMalformedThumbCallInstructionAtomically) {
 }
 
 TEST(ARMRelocationTest, ReadsGeneratedThumbAndCantUnwindObject) {
+  REQUIRE_LLVM_TARGET("armv7-unknown-linux-gnueabihf");
   const auto ObjectBytes =
       makeAssemblyObject(llvm::Triple("armv7-unknown-linux-gnueabihf"),
                          R"(.syntax unified
@@ -3572,6 +3602,7 @@ target:
 }
 
 TEST(ARMRelocationTest, RejectsGeneratedPersonalityImport) {
+  REQUIRE_LLVM_TARGET("armv7-unknown-linux-gnueabihf");
   const auto ObjectBytes =
       makeObject(llvm::Triple("armv7-unknown-linux-gnueabihf"), false, false,
                  "f0", {}, true, true, "generic", "+thumb-mode", true);
@@ -3824,6 +3855,7 @@ TEST(AArch64RelocationTest, EncodesAdrpAddAndLoadPairsExactly) {
 }
 
 TEST(AArch64RelocationTest, RelocatesGeneratedAdrpLow12PairsExactly) {
+  REQUIRE_LLVM_TARGET("aarch64-unknown-linux-gnu");
   auto Graph = ObjectReader::read(
       makeAssemblyObject(llvm::Triple("aarch64-unknown-linux-gnu"),
                          R"(.text
@@ -3949,6 +3981,7 @@ TEST(AArch64RelocationTest, RejectsMalformedCOFFImplicitInstructions) {
 }
 
 TEST(AArch64RelocationTest, RelocatesGeneratedCOFFAddendsExactly) {
+  REQUIRE_LLVM_TARGET("aarch64-pc-windows-msvc");
   const auto Object =
       makeAssemblyObject(llvm::Triple("aarch64-pc-windows-msvc"), R"(
 .text
@@ -4037,6 +4070,7 @@ TEST(RISCVRelocationTest, AppliesAbsoluteCallAndUnwindRelocations) {
 }
 
 TEST(RISCVRelocationTest, ReadsGeneratedSymbolDifferenceObject) {
+  REQUIRE_LLVM_TARGET("riscv64-unknown-linux-gnu");
   constexpr std::string_view Assembly = R"(
     .pushsection .rodata.symbol_begin,"a",@progbits
   begin:
@@ -4072,6 +4106,7 @@ TEST(RISCVRelocationTest, ReadsGeneratedSymbolDifferenceObject) {
 }
 
 TEST(RISCVRelocationTest, ReadsGeneratedByteSymbolDifferenceObject) {
+  REQUIRE_LLVM_TARGET("riscv64-unknown-linux-gnu");
   constexpr std::string_view Assembly = R"(
     .pushsection .rodata.symbol_begin,"a",@progbits
   begin:
@@ -4471,6 +4506,10 @@ TEST(RelocationTest, ReadsAndRelocatesGeneratedLinuxObjectsForEveryTarget) {
        {llvm::ELF::R_390_PC32DBL, llvm::ELF::R_390_PLT32DBL}},
   }};
   for (const auto &Test : Cases) {
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Test.Triple), Available);
+    if (!Available)
+      continue;
     std::set<uint64_t> GeneratedTypes;
     for (const bool Optimize : {false, true}) {
       for (const bool Tuned : {false, true}) {
@@ -4572,6 +4611,10 @@ TEST(RelocationTest, RejectsFailingGeneratedRelocationAtomically) {
        llvm::ELF::R_390_64, DoubleWordBytes, ""},
   }};
   for (const auto &Test : Cases) {
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Test.Triple), Available);
+    if (!Available)
+      continue;
     const auto ObjectBytes =
         makeObject(llvm::Triple(Test.Triple), false, false, "representative",
                    {}, true, true, "generic", Test.Features, false, false, true,
@@ -4608,6 +4651,7 @@ TEST(RelocationTest, RejectsFailingGeneratedRelocationAtomically) {
 }
 
 TEST(RelocationTest, AppliesGeneratedELF64PC32AndPLT32RelocationsExactly) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Graph = ObjectReader::read(
       makeX86_64AssemblyObject(
           ".data\n.globl target_data\ntarget_data:\n.quad 0\n"
@@ -4675,6 +4719,10 @@ TEST(RelocationTest, ReadsLayoutsAndRelocatesCurrentMachOAndCOFFForms) {
       {{llvm::Triple("x86_64-apple-macosx"), ObjectFormat::MachO, 1},
        {llvm::Triple("x86_64-pc-windows-msvc"), ObjectFormat::COFF, 4}}};
   for (const auto &Test : Cases) {
+    bool Available;
+    checkLLVMTarget(Test.Triple, Available);
+    if (!Available)
+      continue;
     auto Graph = ObjectReader::read(makeObject(Test.Triple), Target::X86_64);
     ASSERT_TRUE(Graph);
     ASSERT_EQ(Graph->relocations().size(), 1U);
@@ -4835,6 +4883,10 @@ TEST(RelocationTest, ReadsRealisticPortableObjectsWithoutPersonality) {
         llvm::COFF::IMAGE_REL_ARM64_PAGEOFFSET_12A}},
   }};
   for (const auto &Test : Cases) {
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Test.Triple), Available);
+    if (!Available)
+      continue;
     const auto Bytes = makeObject(llvm::Triple(Test.Triple));
     auto Graph = ObjectReader::read(Bytes, Test.Architecture);
     ASSERT_TRUE(Graph) << Test.Triple;
@@ -4854,11 +4906,16 @@ TEST(RelocationTest, ReadsRealisticPortableObjectsWithoutPersonality) {
 }
 
 TEST(EHFrameTest, NormalizesGeneratedMachOFrames) {
-  for (const auto &[Triple, Architecture] :
-       std::array<std::pair<const char *, Target>, 2>{{
+  for (const auto &Case : std::array<std::pair<const char *, Target>, 2>{{
            {"x86_64-apple-macosx", Target::X86_64},
            {"arm64-apple-macosx", Target::AArch64},
        }}) {
+    const auto Triple = Case.first;
+    const auto Architecture = Case.second;
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Triple), Available);
+    if (!Available)
+      continue;
     const auto Object = makeObject(llvm::Triple(Triple), false, false, "f0", {},
                                    false, false, "generic", {}, true, false,
                                    false, false, false, false, {}, false, true);
@@ -4911,6 +4968,10 @@ TEST(CompactUnwindTest, InventoriesObservedLLVMGeneratedMachORecords) {
        true, false},
   }};
   for (const char *Triple : {"x86_64-apple-macosx", "arm64-apple-macosx"}) {
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Triple), Available);
+    if (!Available)
+      continue;
     for (const auto &Fixture : Fixtures) {
       const auto Inventory = collectCompactUnwindInventory(
           makeObject(llvm::Triple(Triple), false, false, "f0", {}, false, false,
@@ -5146,6 +5207,7 @@ TEST(CompactUnwindTest, PreservesExistingDwarfFallbackAndSynthesizesMissing) {
 }
 
 TEST_F(LinkerOutputTest, WritesConvertedCompactUnwindToUniversalWasm) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   constexpr std::array<WasmEdge::Byte, 34> TinyWasm{
       0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0x60,
       0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
@@ -5233,11 +5295,16 @@ TEST_F(LinkerOutputTest, WritesConvertedCompactUnwindToUniversalWasm) {
 }
 
 TEST(MachOWriterTest, LinksGeneratedMacOSObjects) {
-  for (const auto &[Triple, Architecture] :
-       std::array<std::pair<const char *, Target>, 2>{{
+  for (const auto &Case : std::array<std::pair<const char *, Target>, 2>{{
            {"x86_64-apple-macosx", Target::X86_64},
            {"arm64-apple-macosx", Target::AArch64},
        }}) {
+    const auto Triple = Case.first;
+    const auto Architecture = Case.second;
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Triple), Available);
+    if (!Available)
+      continue;
     const auto Object =
         makeObject(llvm::Triple(Triple), false, false, "f0", {}, false, false,
                    "generic", {}, true, false, false, false, false, false, {},
@@ -5336,11 +5403,16 @@ TEST(MachOWriterTest, LinksGeneratedMacOSObjects) {
 }
 
 TEST(PEWriterTest, LinksGeneratedWindowsObjects) {
-  for (const auto &[Triple, Architecture] :
-       std::array<std::pair<const char *, Target>, 2>{{
+  for (const auto &Case : std::array<std::pair<const char *, Target>, 2>{{
            {"x86_64-pc-windows-msvc", Target::X86_64},
            {"aarch64-pc-windows-msvc", Target::AArch64},
        }}) {
+    const auto Triple = Case.first;
+    const auto Architecture = Case.second;
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Triple), Available);
+    if (!Available)
+      continue;
     const auto Object = makeObject(
         llvm::Triple(Triple), false, false, "f0", "/EXPORT:f0 /EXPORT:value",
         false, false, "generic", {}, true, true, false, false, true);
@@ -5455,6 +5527,7 @@ TEST(PEWriterTest, LinksGeneratedWindowsObjects) {
 }
 
 TEST(PEWriterTest, DiscardsUnreferencedCompilerRequiredFltusedMarker) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
   const auto Object =
       makeObject(llvm::Triple("x86_64-pc-windows-msvc"), false, false, "f0",
                  "/EXPORT:f0", false, false, "generic", {}, true, true, false,
@@ -5562,11 +5635,16 @@ TEST(ObjectReaderTest, AppliesMSVCFltusedPolicyOnlyToUnreferencedCOFFMarkers) {
 .type 0;
 .endef
 )";
-  for (const auto &[Triple, Architecture] :
-       std::array<std::pair<const char *, Target>, 2>{{
+  for (const auto &Case : std::array<std::pair<const char *, Target>, 2>{{
            {"x86_64-pc-windows-msvc", Target::X86_64},
            {"aarch64-pc-windows-msvc", Target::AArch64},
        }}) {
+    const auto Triple = Case.first;
+    const auto Architecture = Case.second;
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Triple), Available);
+    if (!Available)
+      continue;
     const auto Object = makeObject(
         llvm::Triple(Triple), false, false, "f0", {}, false, false, "generic",
         {}, false, false, false, false, false, false, std::string(Marker));
@@ -5580,22 +5658,29 @@ TEST(ObjectReaderTest, AppliesMSVCFltusedPolicyOnlyToUnreferencedCOFFMarkers) {
         [](const auto &Symbol) { return Symbol.Name == "_fltused"; }));
   }
 
-  const auto GNUCOFF =
-      makeObject(llvm::Triple("x86_64-w64-windows-gnu"), false, false, "f0", {},
-                 false, false, "generic", {}, false, false, false, false, false,
-                 false, std::string(Marker));
-  EXPECT_FALSE(ObjectReader::read(GNUCOFF, Target::X86_64));
+  withLLVMTarget(llvm::Triple("x86_64-w64-windows-gnu"), [&] {
+    const auto GNUCOFF =
+        makeObject(llvm::Triple("x86_64-w64-windows-gnu"), false, false, "f0",
+                   {}, false, false, "generic", {}, false, false, false, false,
+                   false, false, std::string(Marker));
+    EXPECT_FALSE(ObjectReader::read(GNUCOFF, Target::X86_64));
+  });
 
   constexpr std::string_view Referenced = R"(
 .data
 .p2align 3
 .quad _fltused
 )";
-  for (const auto &[Triple, Architecture] :
-       std::array<std::pair<const char *, Target>, 2>{{
+  for (const auto &Case : std::array<std::pair<const char *, Target>, 2>{{
            {"x86_64-pc-windows-msvc", Target::X86_64},
            {"aarch64-pc-windows-msvc", Target::AArch64},
        }}) {
+    const auto Triple = Case.first;
+    const auto Architecture = Case.second;
+    bool Available;
+    checkLLVMTarget(llvm::Triple(Triple), Available);
+    if (!Available)
+      continue;
     const auto Object =
         makeObject(llvm::Triple(Triple), false, false, "f0", {}, false, false,
                    "generic", {}, false, false, false, false, false, false,
@@ -5606,38 +5691,44 @@ TEST(ObjectReaderTest, AppliesMSVCFltusedPolicyOnlyToUnreferencedCOFFMarkers) {
         << Triple;
   }
 
-  const auto ELF =
-      makeObject(llvm::Triple("x86_64-unknown-linux-gnu"), false, false, "f0",
-                 {}, false, false, "generic", {}, false, false, false, false,
-                 false, false, ".globl _fltused\n.quad _fltused\n");
-  EXPECT_FALSE(ObjectReader::read(
-      ELF, Target::X86_64, ObjectReaderPolicy::Default,
-      ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+  withLLVMTarget(llvm::Triple("x86_64-unknown-linux-gnu"), [&] {
+    const auto ELF =
+        makeObject(llvm::Triple("x86_64-unknown-linux-gnu"), false, false, "f0",
+                   {}, false, false, "generic", {}, false, false, false, false,
+                   false, false, ".globl _fltused\n.quad _fltused\n");
+    EXPECT_FALSE(ObjectReader::read(
+        ELF, Target::X86_64, ObjectReaderPolicy::Default,
+        ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+  });
 
-  const auto OtherUndefined =
-      makeObject(llvm::Triple("x86_64-pc-windows-msvc"), true);
-  EXPECT_FALSE(ObjectReader::read(
-      OtherUndefined, Target::X86_64, ObjectReaderPolicy::Default,
-      ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+  withLLVMTarget(llvm::Triple("x86_64-pc-windows-msvc"), [&] {
+    const auto OtherUndefined =
+        makeObject(llvm::Triple("x86_64-pc-windows-msvc"), true);
+    EXPECT_FALSE(ObjectReader::read(
+        OtherUndefined, Target::X86_64, ObjectReaderPolicy::Default,
+        ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+  });
 
-  const auto ARM64FP =
-      makeObject(llvm::Triple("aarch64-pc-windows-msvc"), false, false, "f0",
-                 {}, false, false, "generic", {}, true, true, false, false,
-                 false, false, {}, false, false, true);
-  auto ParsedARM64 =
-      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
-          llvm::StringRef(reinterpret_cast<const char *>(ARM64FP.data()),
-                          ARM64FP.size()),
-          "arm64-floating.obj"));
-  ASSERT_TRUE(static_cast<bool>(ParsedARM64));
-  for (const auto &Symbol : (*ParsedARM64)->symbols()) {
-    auto Name = Symbol.getName();
-    ASSERT_TRUE(static_cast<bool>(Name));
-    EXPECT_NE(*Name, "_fltused");
-  }
-  EXPECT_TRUE(ObjectReader::read(
-      ARM64FP, Target::AArch64, ObjectReaderPolicy::Default,
-      ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+  withLLVMTarget(llvm::Triple("aarch64-pc-windows-msvc"), [&] {
+    const auto ARM64FP =
+        makeObject(llvm::Triple("aarch64-pc-windows-msvc"), false, false, "f0",
+                   {}, false, false, "generic", {}, true, true, false, false,
+                   false, false, {}, false, false, true);
+    auto ParsedARM64 =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(ARM64FP.data()),
+                            ARM64FP.size()),
+            "arm64-floating.obj"));
+    ASSERT_TRUE(static_cast<bool>(ParsedARM64));
+    for (const auto &Symbol : (*ParsedARM64)->symbols()) {
+      auto Name = Symbol.getName();
+      ASSERT_TRUE(static_cast<bool>(Name));
+      EXPECT_NE(*Name, "_fltused");
+    }
+    EXPECT_TRUE(ObjectReader::read(
+        ARM64FP, Target::AArch64, ObjectReaderPolicy::Default,
+        ObjectReaderInputPolicy::AllowUnreferencedMSVCFltused));
+  });
 }
 
 TEST(NativeLinkerTest, SelectsCRTMarkerPolicyFromHostABI) {
@@ -5648,6 +5739,7 @@ TEST(NativeLinkerTest, SelectsCRTMarkerPolicyFromHostABI) {
 }
 
 TEST(EHFrameTest, RequiresTypeWrapperCoverage) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   auto Object = makeObject(llvm::Triple("arm64-apple-macosx"), false, false,
                            "f0", {}, false, false, "generic", {}, true, false,
                            false, false, false, false, {}, false, true);
@@ -5718,6 +5810,7 @@ TEST(EHFrameTest, RequiresTypeWrapperCoverage) {
 }
 
 TEST(EHFrameTest, CollapsesAliasedSemanticFunctionAddresses) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   auto Object = makeObject(llvm::Triple("arm64-apple-macosx"), false, false,
                            "f0", {}, false, false, "generic", {}, true, false,
                            false, false, false, false, {}, false, true);
@@ -5795,6 +5888,7 @@ TEST(EHFrameTest, RejectsMalformedRecordsAtomically) {
 }
 
 TEST(EHFrameTest, ReportsFDEInitialLocationFields) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   const auto Bytes = makeAArch64MachOEHFrameObject();
   const auto Object = machOEHFrameObject(Bytes);
   ASSERT_NE(Object.Content, 0U);
@@ -5841,6 +5935,7 @@ TEST(EHFrameTest, RejectsReferenceOutsideFDEInitialLocationField) {
 }
 
 TEST(ObjectReaderTest, ParsesPairedAArch64MachOEHFrameReference) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   const auto Bytes = makeAArch64MachOEHFrameObject();
   auto Graph =
       ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
@@ -5860,6 +5955,7 @@ TEST(ObjectReaderTest, ParsesPairedAArch64MachOEHFrameReference) {
 }
 
 TEST(ObjectReaderTest, RejectsMalformedAArch64MachOEHFramePairs) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   const auto Original = makeAArch64MachOEHFrameObject();
   const auto Object = machOEHFrameObject(Original);
   ASSERT_EQ(Object.Relocations.size(), 2U);
@@ -5918,6 +6014,7 @@ TEST(ObjectReaderTest, RejectsMalformedAArch64MachOEHFramePairs) {
 }
 
 TEST(ObjectReaderTest, PreservesX86MachOEHFrameRelocation) {
+  REQUIRE_LLVM_TARGET("x86_64-apple-macosx");
   constexpr std::string_view Frame = R"(
 .section __TEXT,__eh_frame,coalesced,no_toc+strip_static_syms+live_support
 .quad _f0
@@ -5941,6 +6038,7 @@ TEST(ObjectReaderTest, PreservesX86MachOEHFrameRelocation) {
 }
 
 TEST(ObjectReaderTest, ParsesCompactOnlyAArch64MachOUnwind) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   const auto CompactOnly =
       makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
                  false, false, "generic", {}, true);
@@ -5963,6 +6061,7 @@ TEST(ObjectReaderTest, ParsesCompactOnlyAArch64MachOUnwind) {
 }
 
 TEST(ObjectReaderTest, ParsesCompactUnwindUnderBothPolicies) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   const auto Bytes =
       makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
                  false, false, "generic", {}, true);
@@ -6045,6 +6144,7 @@ TEST(ObjectReaderTest, DiagnosesMalformedDecodedCompactUnwind) {
 }
 
 TEST(ObjectReaderTest, AssociatesZeroDwarfInputByFunctionFDE) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   auto Mixed =
       makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
                  false, false, "generic", {}, true, true, false, false, true);
@@ -6063,6 +6163,7 @@ TEST(ObjectReaderTest, AssociatesZeroDwarfInputByFunctionFDE) {
 }
 
 TEST(ObjectReaderTest, AssociatesExactNonzeroDwarfOffset) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   auto Mixed =
       makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
                  false, false, "generic", {}, true, true, false, false, true);
@@ -6272,6 +6373,7 @@ TEST(CompactUnwindTest, RejectsX86DwarfFallbackWithoutExactAssociation) {
 }
 
 TEST(ObjectReaderTest, RejectsWrongDwarfCompactUnwindOffset) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   auto Bytes =
       makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
                  false, false, "generic", {}, true, true, false, false, true);
@@ -6285,6 +6387,7 @@ TEST(ObjectReaderTest, RejectsWrongDwarfCompactUnwindOffset) {
 }
 
 TEST(ObjectReaderTest, LeavesX86_64MachOEHOnlyUnchanged) {
+  REQUIRE_LLVM_TARGET("x86_64-apple-macosx");
   const auto EHOnly =
       makeObject(llvm::Triple("x86_64-apple-macosx"), false, false, "f0", {},
                  false, false, "generic", {}, true);
@@ -6299,6 +6402,7 @@ TEST(ObjectReaderTest, LeavesX86_64MachOEHOnlyUnchanged) {
 }
 
 TEST(ObjectReaderTest, ParsesAssembledX86_64MachOCompactUnwind) {
+  REQUIRE_LLVM_TARGET("x86_64-apple-macosx");
   constexpr std::string_view CompactUnwind = R"(
 .section __LD,__compact_unwind,regular,debug
 .p2align 3
@@ -6325,6 +6429,7 @@ TEST(ObjectReaderTest, ParsesAssembledX86_64MachOCompactUnwind) {
 }
 
 TEST(ObjectReaderTest, RejectsMalformedAArch64MachOCompactUnwind) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   const auto MakeCompact = [] {
     return makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0",
                       {}, false, false, "generic", {}, true);
@@ -6393,6 +6498,7 @@ TEST(ObjectReaderTest, RejectsMalformedAArch64MachOCompactUnwind) {
 }
 
 TEST(ObjectReaderTest, RejectsDuplicateAArch64MachOCompactUnwindRelocation) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   auto Bytes = makeObject(llvm::Triple("arm64-apple-macosx"), false, false,
                           "f0", {}, false, false, "generic", {}, true, false,
                           false, false, false, false, {}, false, true);
@@ -6417,16 +6523,20 @@ TEST(ObjectReaderTest, RejectsDuplicateAArch64MachOCompactUnwindRelocation) {
 }
 
 TEST(RelocationTest, RejectsPortablePersonalityObjects) {
-  EXPECT_FALSE(
-      ObjectReader::read(makeObject(llvm::Triple("x86_64-apple-macosx"), false,
-                                    false, "f0", {}, false, false, "generic",
-                                    {}, true, false, false, false, false, true),
-                         Target::X86_64));
-  EXPECT_FALSE(ObjectReader::read(
-      makeObject(llvm::Triple("aarch64-pc-windows-msvc"), false, false, "f0",
-                 {}, false, false, "generic", {}, true, false, false, false,
-                 false, true),
-      Target::AArch64));
+  withLLVMTarget(llvm::Triple("x86_64-apple-macosx"), [&] {
+    EXPECT_FALSE(ObjectReader::read(
+        makeObject(llvm::Triple("x86_64-apple-macosx"), false, false, "f0", {},
+                   false, false, "generic", {}, true, false, false, false,
+                   false, true),
+        Target::X86_64));
+  });
+  withLLVMTarget(llvm::Triple("aarch64-pc-windows-msvc"), [&] {
+    EXPECT_FALSE(ObjectReader::read(
+        makeObject(llvm::Triple("aarch64-pc-windows-msvc"), false, false, "f0",
+                   {}, false, false, "generic", {}, true, false, false, false,
+                   false, true),
+        Target::AArch64));
+  });
 }
 
 TEST(ObjectReaderTest, RejectsMalformedBytes) {
@@ -6459,6 +6569,7 @@ TEST(ObjectReaderTest, RejectsMalformedCOFFExportDirectives) {
 }
 
 TEST(ObjectReaderTest, NormalizesX86_64ELFRelaObject) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   const auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
   auto Result = ObjectReader::read(Bytes, Target::X86_64);
   ASSERT_TRUE(Result);
@@ -6507,6 +6618,7 @@ TEST(ObjectReaderTest, NormalizesX86_64ELFRelaObject) {
 }
 
 TEST(ObjectReaderTest, ReadsCOFFExportsFromDirectives) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
   auto Result = ObjectReader::read(
       makeObject(llvm::Triple("x86_64-pc-windows-msvc"), false, true),
       Target::X86_64);
@@ -6519,6 +6631,7 @@ TEST(ObjectReaderTest, ReadsCOFFExportsFromDirectives) {
 }
 
 TEST(ObjectReaderTest, NormalizesRenamedCOFFExport) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
   auto Result =
       ObjectReader::read(makeObject(llvm::Triple("x86_64-pc-windows-msvc"),
                                     false, false, "real", "/EXPORT:alias=real"),
@@ -6534,6 +6647,7 @@ TEST(ObjectReaderTest, NormalizesRenamedCOFFExport) {
 }
 
 TEST(ObjectReaderTest, ExportsMachOExternalDefinedSymbols) {
+  REQUIRE_LLVM_TARGET("x86_64-apple-macosx");
   auto Result = ObjectReader::read(
       makeObject(llvm::Triple("x86_64-apple-macosx")), Target::X86_64);
   ASSERT_TRUE(Result);
@@ -6555,41 +6669,45 @@ TEST(ObjectReaderTest, RejectsArm64eMachOSubtypes) {
   constexpr uint32_t CPU_SUBTYPE_ARM64E = 2;
   constexpr uint32_t CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_1 = 0x81000002;
   constexpr uint32_t CPU_SUBTYPE_LIB64 = 0x80000000;
-  const auto Generic = makeObject(llvm::Triple("arm64-apple-macosx"));
-  ASSERT_EQ(read32le(Generic, MachOCPUSubtypeOffset), CPU_SUBTYPE_ARM64_ALL);
-  for (const auto Policy : {ObjectReaderPolicy::Default,
-                            ObjectReaderPolicy::Universal}) {
-    EXPECT_TRUE(ObjectReader::read(Generic, Target::AArch64, Policy));
-    auto GenericWithCapabilities = Generic;
-    write32le(GenericWithCapabilities, MachOCPUSubtypeOffset,
-              CPU_SUBTYPE_LIB64 | CPU_SUBTYPE_ARM64_ALL);
-    EXPECT_TRUE(ObjectReader::read(GenericWithCapabilities, Target::AArch64,
-                                   Policy));
-    for (const uint32_t Subtype : {CPU_SUBTYPE_ARM64E,
-                                   CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_1,
-                                   CPU_SUBTYPE_LIB64 | CPU_SUBTYPE_ARM64E}) {
-      auto Arm64e = Generic;
-      write32le(Arm64e, MachOCPUSubtypeOffset, Subtype);
-      std::string Diagnostic;
-      WasmEdge::Log::setLoggingCallback(
-          [&](const spdlog::details::log_msg &Value) {
-            Diagnostic.assign(Value.payload.data(), Value.payload.size());
-          });
-      WasmEdge::Log::setErrorLoggingLevel();
-      auto Result = ObjectReader::read(Arm64e, Target::AArch64, Policy);
-      WasmEdge::Log::setLoggingCallback(nullptr);
-      EXPECT_FALSE(Result);
-      EXPECT_NE(Diagnostic.find("including arm64e"),
-                std::string::npos)
-          << Diagnostic;
+  withLLVMTarget(llvm::Triple("arm64-apple-macosx"), [&] {
+    const auto Generic = makeObject(llvm::Triple("arm64-apple-macosx"));
+    ASSERT_EQ(read32le(Generic, MachOCPUSubtypeOffset), CPU_SUBTYPE_ARM64_ALL);
+    for (const auto Policy :
+         {ObjectReaderPolicy::Default, ObjectReaderPolicy::Universal}) {
+      EXPECT_TRUE(ObjectReader::read(Generic, Target::AArch64, Policy));
+      auto GenericWithCapabilities = Generic;
+      write32le(GenericWithCapabilities, MachOCPUSubtypeOffset,
+                CPU_SUBTYPE_LIB64 | CPU_SUBTYPE_ARM64_ALL);
+      EXPECT_TRUE(
+          ObjectReader::read(GenericWithCapabilities, Target::AArch64, Policy));
+      for (const uint32_t Subtype :
+           {CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_ARM64E_PTRAUTH_VERSION_1,
+            CPU_SUBTYPE_LIB64 | CPU_SUBTYPE_ARM64E}) {
+        auto Arm64e = Generic;
+        write32le(Arm64e, MachOCPUSubtypeOffset, Subtype);
+        std::string Diagnostic;
+        WasmEdge::Log::setLoggingCallback(
+            [&](const spdlog::details::log_msg &Value) {
+              Diagnostic.assign(Value.payload.data(), Value.payload.size());
+            });
+        WasmEdge::Log::setErrorLoggingLevel();
+        auto Result = ObjectReader::read(Arm64e, Target::AArch64, Policy);
+        WasmEdge::Log::setLoggingCallback(nullptr);
+        EXPECT_FALSE(Result);
+        EXPECT_NE(Diagnostic.find("including arm64e"), std::string::npos)
+            << Diagnostic;
+      }
     }
-  }
+  });
 
-  const auto X86 = makeObject(llvm::Triple("x86_64-apple-macosx"));
-  EXPECT_TRUE(ObjectReader::read(X86, Target::X86_64));
+  withLLVMTarget(llvm::Triple("x86_64-apple-macosx"), [&] {
+    const auto X86 = makeObject(llvm::Triple("x86_64-apple-macosx"));
+    EXPECT_TRUE(ObjectReader::read(X86, Target::X86_64));
+  });
 }
 
 TEST(ObjectReaderTest, RejectsMalformedX86_64MachOSignedMetadata) {
+  REQUIRE_LLVM_TARGET("x86_64-apple-macosx");
   auto Bytes = makeObject(llvm::Triple("x86_64-apple-macosx"));
   auto Object =
       llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
@@ -6629,6 +6747,7 @@ TEST(ObjectReaderTest, RejectsMalformedX86_64MachOSignedMetadata) {
 }
 
 TEST(ObjectReaderTest, RejectsScatteredAArch64MachORelocation) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
   EXPECT_FALSE(
       Internal::supportsMachORelocationMetadata(Target::AArch64, true));
   auto Bytes = makeObject(llvm::Triple("arm64-apple-macosx"));
@@ -6659,6 +6778,7 @@ TEST(ObjectReaderTest, RejectsScatteredAArch64MachORelocation) {
 }
 
 TEST(ObjectReaderTest, DoesNotExportHiddenMachOSymbols) {
+  REQUIRE_LLVM_TARGET("x86_64-apple-macosx");
   auto Result =
       ObjectReader::read(makeObject(llvm::Triple("x86_64-apple-macosx"), false,
                                     false, "hidden", {}, true),
@@ -6672,6 +6792,7 @@ TEST(ObjectReaderTest, DoesNotExportHiddenMachOSymbols) {
 }
 
 TEST(ObjectReaderTest, RejectsELFRelocationWithInvalidSectionLink) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
   const auto Header = elf64RelocationSectionHeader(Bytes);
   Bytes[Header + 40] = 0xFF;
@@ -6682,6 +6803,7 @@ TEST(ObjectReaderTest, RejectsELFRelocationWithInvalidSectionLink) {
 }
 
 TEST(ObjectReaderTest, RejectsELFRelocationWithZeroEntrySize) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
   const auto Header = elf64RelocationSectionHeader(Bytes);
   write64le(Bytes, Header + 56, 0);
@@ -6689,6 +6811,7 @@ TEST(ObjectReaderTest, RejectsELFRelocationWithZeroEntrySize) {
 }
 
 TEST(ObjectReaderTest, RejectsTruncatedELFRelocationTable) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
   const auto Header = elf64RelocationSectionHeader(Bytes);
   write64le(Bytes, Header + 32, read64le(Bytes, Header + 32) - 1);
@@ -6696,6 +6819,7 @@ TEST(ObjectReaderTest, RejectsTruncatedELFRelocationTable) {
 }
 
 TEST(ObjectReaderTest, RejectsELFRelocationWithInvalidSymbolIndex) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
   const auto Header = elf64RelocationSectionHeader(Bytes);
   const auto RelocationOffset = read64le(Bytes, Header + 24);
@@ -6705,6 +6829,7 @@ TEST(ObjectReaderTest, RejectsELFRelocationWithInvalidSymbolIndex) {
 
 #if LLVM_VERSION_MAJOR >= 19
 TEST(ObjectReaderTest, NormalizesELFCrelRelocation) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Result = ObjectReader::read(makeX86_64CrelObject(), Target::X86_64);
   ASSERT_TRUE(Result);
   ASSERT_EQ(Result->relocations().size(), 1U);
@@ -6715,6 +6840,7 @@ TEST(ObjectReaderTest, NormalizesELFCrelRelocation) {
 }
 
 TEST(ObjectReaderTest, RejectsTruncatedELFCrelRelocation) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Bytes = makeX86_64CrelObject();
   const auto Header = elf64RelocationSectionHeader(Bytes);
   write64le(Bytes, Header + 32, 1);
@@ -6723,6 +6849,7 @@ TEST(ObjectReaderTest, RejectsTruncatedELFCrelRelocation) {
 #endif
 
 TEST(ObjectReaderTest, MarksELFRelAddendsImplicit) {
+  REQUIRE_LLVM_TARGET("armv7-unknown-linux-gnueabihf");
   auto Result = ObjectReader::read(
       makeObject(llvm::Triple("armv7-unknown-linux-gnueabihf"), false, false,
                  "f0", {}, false, true),
@@ -6734,6 +6861,7 @@ TEST(ObjectReaderTest, MarksELFRelAddendsImplicit) {
 }
 
 TEST(ObjectReaderTest, PreservesARMHardFloatMetadata) {
+  REQUIRE_LLVM_TARGET("armv7-unknown-linux-gnueabihf");
   auto Bytes = makeAssemblyObject(
       llvm::Triple("armv7-unknown-linux-gnueabihf"),
       ".syntax unified\n.text\n.globl f0\nf0:\n bx lr\n", "", true);
@@ -6750,6 +6878,7 @@ TEST(ObjectReaderTest, PreservesARMHardFloatMetadata) {
 }
 
 TEST(ObjectReaderTest, PreservesRISCVArchitectureFlags) {
+  REQUIRE_LLVM_TARGET("riscv64-unknown-linux-gnu");
   const auto Bytes = makeAssemblyObject(
       llvm::Triple("riscv64-unknown-linux-gnu"),
       ".option rvc\n.text\n.globl f0\nf0:\n c.nop\n ret\n", "+c,+f,+d");
@@ -6767,6 +6896,7 @@ TEST(ObjectReaderTest, PreservesRISCVArchitectureFlags) {
 }
 
 TEST(ObjectReaderTest, RejectsNonRelocatableELFObject) {
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
   auto Bytes = makeObject(llvm::Triple("x86_64-unknown-linux-gnu"));
   ASSERT_GT(Bytes.size(), 18U);
   Bytes[16] = 3;
@@ -6777,11 +6907,13 @@ TEST(ObjectReaderTest, RejectsNonRelocatableELFObject) {
 }
 
 TEST(ObjectReaderTest, RejectsUnsupportedObjectFormat) {
+  REQUIRE_LLVM_TARGET("wasm32-unknown-unknown");
   EXPECT_FALSE(ObjectReader::read(
       makeObject(llvm::Triple("wasm32-unknown-unknown")), Target::X86_64));
 }
 
 TEST(ObjectReaderTest, RejectsUnsupportedArchitecture) {
+  REQUIRE_LLVM_TARGET("i386-unknown-linux-gnu");
   EXPECT_FALSE(ObjectReader::read(
       makeObject(llvm::Triple("i386-unknown-linux-gnu")), Target::X86_64));
 }
