@@ -559,7 +559,9 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
         llvm::COFF::IMAGE_FILE_EXECUTABLE_IMAGE |
             llvm::COFF::IMAGE_FILE_LARGE_ADDRESS_AWARE |
             llvm::COFF::IMAGE_FILE_DLL |
-            (RelocSize == 0 ? llvm::COFF::IMAGE_FILE_RELOCS_STRIPPED : 0),
+            (RelocSize == 0
+                 ? static_cast<uint32_t>(llvm::COFF::IMAGE_FILE_RELOCS_STRIPPED)
+                 : 0),
         2);
     const size_t Optional = COFF + 20;
     put(Bytes, Optional, 0x20B, 2);
