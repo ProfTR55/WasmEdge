@@ -6442,12 +6442,15 @@ TEST(ObjectReaderTest, NormalizesZeroSectionAlignment) {
 TEST(ObjectReaderTest, ParsesCOFFExportDirectives) {
   auto Exports = Internal::parseCOFFExports(
       " /DEFAULTLIB:libcmt /EXPORT:f0 /EXPORT:data,DATA "
-      "/EXPORT:ordinal,NONAME /EXPORT:alias=real");
+      "/EXPORT:ordinal,NONAME /EXPORT:alias=real "
+      "/EXPORT:\"wasm.code\",DATA /EXPORT:\"public.name\"=\"real.name\"");
   ASSERT_TRUE(Exports);
   EXPECT_EQ(Exports->at("alias"), "real");
   EXPECT_EQ(Exports->at("data"), "data");
   EXPECT_EQ(Exports->at("f0"), "f0");
   EXPECT_EQ(Exports->at("ordinal"), "ordinal");
+  EXPECT_EQ(Exports->at("public.name"), "real.name");
+  EXPECT_EQ(Exports->at("wasm.code"), "wasm.code");
 }
 
 TEST(ObjectReaderTest, RejectsMalformedCOFFExportDirectives) {

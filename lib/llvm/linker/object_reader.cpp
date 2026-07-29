@@ -672,8 +672,17 @@ parseCOFFExports(std::string_view Input) {
     }
     Token = Token.drop_front(COFFExportPrefix.size());
     Token = Token.split(',').first;
-    const auto [ExportName, SymbolName] = Token.split('=');
-    if (ExportName.empty()) {
+    auto [ExportName, SymbolName] = Token.split('=');
+    auto Unquote = [](llvm::StringRef &Name) {
+      const bool StartsQuoted = !Name.empty() && Name.front() == '"';
+      const bool EndsQuoted = !Name.empty() && Name.back() == '"';
+      if (StartsQuoted != EndsQuoted)
+        return false;
+      if (StartsQuoted)
+        Name = Name.drop_front().drop_back();
+      return true;
+    };
+    if (!Unquote(ExportName) || !Unquote(SymbolName) || ExportName.empty()) {
       return std::nullopt;
     }
     Exports.emplace(ExportName.str(),
