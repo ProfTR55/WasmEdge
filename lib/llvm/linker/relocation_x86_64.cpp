@@ -240,11 +240,12 @@ Expect<RelocationResult> applyX86_64(const LinkGraph &Graph) {
     }
     Addend += FormatAdjustment;
     if (ImageRelative) {
-      if (S < PEImageBase || S - PEImageBase > UINT32_MAX) {
+      const uint64_t ImageBase = S >= PEImageBase ? PEImageBase : 0;
+      if (S - ImageBase > UINT32_MAX) {
         return fail(RelocationValue, "absolute relocation overflows");
       }
-      const uint32_t Value = static_cast<uint32_t>(S - PEImageBase) +
-                             static_cast<uint32_t>(Addend);
+      const uint32_t Value =
+          static_cast<uint32_t>(S - ImageBase) + static_cast<uint32_t>(Addend);
       if (!writeUnsigned(Bytes, RelocationValue.Offset, Width,
                          Graph.endianness(), Value)) {
         return fail(RelocationValue, "absolute relocation overflows");
