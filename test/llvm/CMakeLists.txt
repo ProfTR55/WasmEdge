@@ -15,6 +15,11 @@ target_link_libraries(wasmedgeLLVMCoreTests
   wasmedgeVM
 )
 
+target_compile_definitions(wasmedgeLLVMCoreTests PRIVATE
+  WASMEDGE_LINKER_HAS_AARCH64=$<TARGET_PROPERTY:wasmedgeLLVM,WASMEDGE_LINKER_HAS_AARCH64>
+  WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS=$<TARGET_PROPERTY:wasmedgeLLVM,WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS>
+)
+
 target_include_directories(wasmedgeLLVMCoreTests
   PRIVATE
   ${PROJECT_SOURCE_DIR}/lib/llvm

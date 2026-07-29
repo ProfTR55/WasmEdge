@@ -50,6 +50,29 @@ namespace {
 
 using namespace WasmEdge::LLVM::Linker;
 
+#define REQUIRE_LINUX_RELOCATIONS()                                            \
+  do {                                                                         \
+    if (!WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS) {                              \
+      GTEST_SKIP() << "ARM, RISC-V, and S390X relocation handlers are not "    \
+                      "compiled";                                              \
+    }                                                                          \
+  } while (false)
+
+bool hasRelocationHandler(Target Architecture) {
+  switch (Architecture) {
+  case Target::X86_64:
+    return true;
+  case Target::AArch64:
+    return WASMEDGE_LINKER_HAS_AARCH64;
+  case Target::ARM:
+  case Target::RISCV64:
+  case Target::S390X:
+    return WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS;
+  default:
+    return false;
+  }
+}
+
 template <typename F>
 bool mutateSectionContent(LinkGraph &Graph, SectionId Id, F &&Mutate) {
   auto Content = Graph.sectionContent(Id);
@@ -748,6 +771,8 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
        static_cast<uint32_t>(llvm::ELF::R_390_RELATIVE), true},
   }};
   for (const auto &Test : Cases) {
+    if (!hasRelocationHandler(Test.Architecture))
+      continue;
     auto Graph = makeELFGraph(Test);
     ASSERT_TRUE(ELFWriter::layout(Graph));
     ASSERT_TRUE(mutateSectionContent(Graph, 2, [&](auto &EHContent) {
@@ -1074,6 +1099,7 @@ TEST(ELFWriterTest, OmitsEHFrameHeaderWithoutEHFrame) {
 }
 
 TEST(ELFWriterTest, WritesARMExidxAndHardFloatABI) {
+  REQUIRE_LINUX_RELOCATIONS();
   LinkGraph Graph(Target::ARM, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("arm.o"));
   ASSERT_TRUE(Graph.setELFFlags(llvm::ELF::EF_ARM_EABI_VER5 |
@@ -1153,6 +1179,7 @@ TEST(ELFWriterTest, WritesARMExidxAndHardFloatABI) {
 }
 
 TEST(ELFWriterTest, PreservesARMExidxAssociationsAndUsesOneSegment) {
+  REQUIRE_LINUX_RELOCATIONS();
   LinkGraph Graph(Target::ARM, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("many-arm.o"));
   ASSERT_TRUE(Graph.setELFFlags(llvm::ELF::EF_ARM_EABI_VER5 |
@@ -1249,6 +1276,9 @@ TEST(ELFWriterTest, RejectsConflictingARMABIFlags) {
   ASSERT_TRUE(Graph.addSection(
       Section{".text", SectionKind::Text, 4, 4, 0, 0, {0, 0, 0, 0}}));
   ASSERT_TRUE(ELFWriter::layout(Graph));
+  if (!hasRelocationHandler(Target::ARM)) {
+    GTEST_SKIP() << "ARM relocation handler is not compiled";
+  }
   ASSERT_TRUE(applyRelocations(Graph));
   std::vector<WasmEdge::Byte> Bytes;
   Writer Output(Bytes);
@@ -1480,6 +1510,9 @@ TEST(ELFWriterTest, RejectsELF32GeneratedMetadataOverflowAtomically) {
   ASSERT_TRUE(Text);
   ASSERT_TRUE(Graph.setSectionAddress(*Text, UINT32_MAX - 2047));
   ASSERT_TRUE(Graph.setSectionFileOffset(*Text, UINT32_MAX - 2047));
+  if (!hasRelocationHandler(Target::ARM)) {
+    GTEST_SKIP() << "ARM relocation handler is not compiled";
+  }
   ASSERT_TRUE(applyRelocations(Graph));
   std::vector<WasmEdge::Byte> Bytes;
   Writer Output(Bytes);

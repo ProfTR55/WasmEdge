@@ -225,6 +225,14 @@ const llvm::Target *lookupLLVMTarget(const llvm::Triple &Triple,
     }                                                                          \
   } while (false)
 
+#define REQUIRE_LINUX_RELOCATIONS()                                            \
+  do {                                                                         \
+    if (!WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS) {                              \
+      GTEST_SKIP() << "ARM, RISC-V, and S390X relocation handlers are not "    \
+                      "compiled";                                              \
+    }                                                                          \
+  } while (false)
+
 template <typename Func>
 void withLLVMTarget(const llvm::Triple &Triple, Func &&Run) {
   std::string Error;
@@ -239,6 +247,21 @@ void checkLLVMTarget(const llvm::Triple &Triple, bool &Available) {
   Available = lookupLLVMTarget(Triple, Error) != nullptr;
   if (!Available) {
     GTEST_SKIP() << Triple.str() << ": " << Error;
+  }
+}
+
+bool hasRelocationHandler(Target Architecture) {
+  switch (Architecture) {
+  case Target::X86_64:
+    return true;
+  case Target::AArch64:
+    return WASMEDGE_LINKER_HAS_AARCH64;
+  case Target::ARM:
+  case Target::RISCV64:
+  case Target::S390X:
+    return WASMEDGE_LINKER_HAS_LINUX_RELOCATIONS;
+  default:
+    return false;
   }
 }
 
@@ -1647,24 +1670,40 @@ TEST_F(LinkerOutputTest, RetainsUnusedAllocatableSections) {
   auto Graph =
       ObjectReader::read(Object, nativeTarget(), ObjectReaderPolicy::Universal);
   ASSERT_TRUE(Graph);
-  std::vector<WasmEdge::Byte> UnusedText;
-  std::vector<WasmEdge::Byte> UnusedData;
-  for (const auto &Section : Graph->sections()) {
-    if (Section.Name.find("text.unused") != std::string::npos) {
-      EXPECT_EQ(Section.Kind, SectionKind::Text);
-      UnusedText = Section.Content;
-    }
-    if (Section.Name.find("data.unused") != std::string::npos) {
-      EXPECT_EQ(Section.Kind, SectionKind::Data);
-      UnusedData = Section.Content;
+  SectionId UnusedTextSection = InvalidSectionId;
+  SectionId UnusedDataSection = InvalidSectionId;
+  uint64_t UnusedDataOffset = 0;
+  uint64_t UnusedDataSize = 0;
+  for (const auto &Symbol : Graph->symbols()) {
+    if (!Symbol.Exported && !Symbol.Global)
+      continue;
+    if (Symbol.Name == "unused_function" || Symbol.Name == "_unused_function")
+      UnusedTextSection = Symbol.Section;
+    if (Symbol.Name == "unused_data" || Symbol.Name == "_unused_data") {
+      UnusedDataSection = Symbol.Section;
+      UnusedDataOffset = Symbol.Offset;
+      UnusedDataSize = Symbol.Size;
     }
   }
+  ASSERT_LT(UnusedTextSection, Graph->sections().size());
+  ASSERT_LT(UnusedDataSection, Graph->sections().size());
+  const auto &UnusedText = Graph->sections()[UnusedTextSection].Content;
+  const std::vector<WasmEdge::Byte> UnusedData{0x67, 0x63, 0x6F, 0x6E};
+  EXPECT_EQ(Graph->sections()[UnusedTextSection].Kind, SectionKind::Text);
+  EXPECT_TRUE(Graph->sections()[UnusedDataSection].Kind == SectionKind::Data ||
+              Graph->sections()[UnusedDataSection].Kind ==
+                  SectionKind::ReadOnly);
   ASSERT_FALSE(UnusedText.empty());
-  ASSERT_EQ(UnusedData, (std::vector<WasmEdge::Byte>{0x67, 0x63, 0x6F, 0x6E}));
   auto Contains = [](const auto &Bytes, const auto &Marker) {
     return std::search(Bytes.begin(), Bytes.end(), Marker.begin(),
                        Marker.end()) != Bytes.end();
   };
+  const auto &UnusedDataContent = Graph->sections()[UnusedDataSection].Content;
+  ASSERT_EQ(UnusedDataSize, UnusedData.size());
+  ASSERT_LE(UnusedDataOffset, UnusedDataContent.size());
+  ASSERT_LE(UnusedDataSize, UnusedDataContent.size() - UnusedDataOffset);
+  EXPECT_TRUE(std::equal(UnusedData.begin(), UnusedData.end(),
+                         UnusedDataContent.begin() + UnusedDataOffset));
 
   const auto Universal = Directory / "retained.wasm";
   ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Universal,
@@ -3437,6 +3476,7 @@ LinkGraph makeELFRelocationGraph(
 }
 
 TEST(ARMRelocationTest, AppliesDataRelocationsAndPreservesPrel31TopBit) {
+  REQUIRE_LINUX_RELOCATIONS();
   auto Absolute = makeELFRelocationGraph(Target::ARM, Endianness::Little, 2, 4,
                                          0x2000, 0x1000, 0, 0, true);
   std::array<WasmEdge::Byte, 4> Addend{};
@@ -3469,6 +3509,7 @@ TEST(ARMRelocationTest, AppliesDataRelocationsAndPreservesPrel31TopBit) {
 }
 
 TEST(ARMRelocationTest, EncodesArmCallAndChecksRangeAlignmentAndEndianness) {
+  REQUIRE_LINUX_RELOCATIONS();
   for (const auto &[Delta, Accepted] :
        std::array<std::pair<int64_t, bool>, 6>{{{4, true},
                                                 {-4, true},
@@ -3500,6 +3541,7 @@ TEST(ARMRelocationTest, EncodesArmCallAndChecksRangeAlignmentAndEndianness) {
 }
 
 TEST(ARMRelocationTest, DecodesImplicitBranchAddendFromImm24) {
+  REQUIRE_LINUX_RELOCATIONS();
   std::vector<WasmEdge::Byte> Bytes(16);
   ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
                                       UINT32_C(0xEBFFFFFE)));
@@ -3513,6 +3555,7 @@ TEST(ARMRelocationTest, DecodesImplicitBranchAddendFromImm24) {
 }
 
 TEST(ARMRelocationTest, EncodesThumbCallBoundariesAndImplicitAddend) {
+  REQUIRE_LINUX_RELOCATIONS();
   constexpr uint32_t ThumbBl = UINT32_C(0xF800F000);
   constexpr uint64_t PatchAddress = UINT64_C(0x2000000);
   struct Case {
@@ -3557,6 +3600,7 @@ TEST(ARMRelocationTest, EncodesThumbCallBoundariesAndImplicitAddend) {
 }
 
 TEST(ARMRelocationTest, RejectsMalformedThumbCallInstructionAtomically) {
+  REQUIRE_LINUX_RELOCATIONS();
   std::vector<WasmEdge::Byte> Bytes(16);
   ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
                                       UINT32_C(0x8000F000)));
@@ -3632,6 +3676,34 @@ target:
                             return Value.Section == ExidxId &&
                                    Value.Type == llvm::ELF::R_ARM_PREL31;
                           }));
+}
+
+TEST(ARMRelocationTest, RelocatesGeneratedThumbAndCantUnwindObject) {
+  REQUIRE_LINUX_RELOCATIONS();
+  REQUIRE_LLVM_TARGET("armv7-unknown-linux-gnueabihf");
+  const auto ObjectBytes =
+      makeAssemblyObject(llvm::Triple("armv7-unknown-linux-gnueabihf"),
+                         R"(.syntax unified
+.thumb
+.section .text,"ax",%progbits
+.globl caller
+.thumb_func
+.type caller,%function
+caller:
+.fnstart
+  bl target
+  bx lr
+.cantunwind
+.fnend
+.section .text.target,"ax",%progbits
+.thumb_func
+.type target,%function
+target:
+  bx lr
+)",
+                         "+thumb-mode");
+  auto Graph = ObjectReader::read(ObjectBytes, Target::ARM);
+  ASSERT_TRUE(Graph);
   ASSERT_TRUE(layout(*Graph, 0x1000));
   EXPECT_TRUE(applyRelocations(*Graph));
 }
@@ -3644,12 +3716,14 @@ TEST(ARMRelocationTest, RejectsGeneratedPersonalityImport) {
   EXPECT_FALSE(ObjectReader::read(ObjectBytes, Target::ARM));
 }
 
-TEST(ARMRelocationTest,
-     AcceptsNoneOnlyAtZeroWidthAndRejectsUnsupportedAtomically) {
+TEST(ARMRelocationTest, AcceptsNoneOnlyAtZeroWidth) {
+  REQUIRE_LINUX_RELOCATIONS();
   auto None =
       makeELFRelocationGraph(Target::ARM, Endianness::Little, 0, 0, 0x1000);
   ASSERT_TRUE(applyRelocations(None));
+}
 
+TEST(ARMRelocationTest, RejectsUnsupportedAtomically) {
   auto Unsupported =
       makeELFRelocationGraph(Target::ARM, Endianness::Little, 2, 4, 0x1100);
   const_cast<std::vector<Relocation> &>(Unsupported.relocations())[0].Type = 99;
@@ -4072,6 +4146,7 @@ data:
 }
 
 TEST(RISCVRelocationTest, AppliesAbsoluteCallAndUnwindRelocations) {
+  REQUIRE_LINUX_RELOCATIONS();
   auto Absolute = makeELFRelocationGraph(Target::RISCV64, Endianness::Little, 2,
                                          8, 0x2000, 0x1000, 0, -8);
   ASSERT_TRUE(applyRelocations(Absolute));
@@ -4179,6 +4254,7 @@ TEST(RISCVRelocationTest, ReadsGeneratedByteSymbolDifferenceObject) {
 }
 
 TEST(RISCVRelocationTest, AppliesSymbolDifferencePairsModulo32InEitherOrder) {
+  REQUIRE_LINUX_RELOCATIONS();
   struct Case {
     uint64_t AddOffset;
     uint64_t SubOffset;
@@ -4243,6 +4319,7 @@ TEST(RISCVRelocationTest, RejectsMalformedSymbolDifferencePairsAtomically) {
 }
 
 TEST(RISCVRelocationTest, PairsPcrelLowWithMarkedHighSiteAndAllowsRelax) {
+  REQUIRE_LINUX_RELOCATIONS();
   LinkGraph Graph(Target::RISCV64, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("input.o"));
   std::vector<WasmEdge::Byte> Bytes(12);
@@ -4274,6 +4351,7 @@ TEST(RISCVRelocationTest, PairsPcrelLowWithMarkedHighSiteAndAllowsRelax) {
 }
 
 TEST(RISCVRelocationTest, PairsPcrelLowBeforeHighRelocation) {
+  REQUIRE_LINUX_RELOCATIONS();
   LinkGraph Graph(Target::RISCV64, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("input.o"));
   std::vector<WasmEdge::Byte> Bytes(8);
@@ -4305,6 +4383,7 @@ TEST(RISCVRelocationTest, PairsPcrelLowBeforeHighRelocation) {
 }
 
 TEST(RISCVRelocationTest, RejectsMalformedHighBeforeMutation) {
+  REQUIRE_LINUX_RELOCATIONS();
   LinkGraph Graph(Target::RISCV64, Endianness::Little);
   ASSERT_TRUE(Graph.beginInput("input.o"));
   std::vector<WasmEdge::Byte> Bytes(8);
@@ -4330,6 +4409,7 @@ TEST(RISCVRelocationTest, RejectsMalformedHighBeforeMutation) {
 }
 
 TEST(RISCVRelocationTest, RejectsMissingLowPairAndInvalidOpcodes) {
+  REQUIRE_LINUX_RELOCATIONS();
   std::vector<WasmEdge::Byte> Bytes(16);
   ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
                                       UINT32_C(0x00000293)));
@@ -4344,6 +4424,7 @@ TEST(RISCVRelocationTest, RejectsMissingLowPairAndInvalidOpcodes) {
 }
 
 TEST(RISCVRelocationTest, EncodesCallPltAndPcrelLo12SExactly) {
+  REQUIRE_LINUX_RELOCATIONS();
   std::vector<WasmEdge::Byte> CallBytes(16);
   ASSERT_TRUE(Internal::writeUnsigned(CallBytes, 0, 4, Endianness::Little,
                                       UINT32_C(0x00000097)));
@@ -4388,6 +4469,7 @@ TEST(RISCVRelocationTest, EncodesCallPltAndPcrelLo12SExactly) {
 }
 
 TEST(RISCVRelocationTest, ChecksCallPltSignedRange) {
+  REQUIRE_LINUX_RELOCATIONS();
   constexpr uint64_t PatchAddress = UINT64_C(0x200000000);
   struct Case {
     int64_t Delta;
@@ -4421,6 +4503,7 @@ TEST(RISCVRelocationTest, ChecksCallPltSignedRange) {
 }
 
 TEST(S390XRelocationTest, AppliesBigEndianAbsoluteAndPcRelativeRelocations) {
+  REQUIRE_LINUX_RELOCATIONS();
   auto Absolute = makeELFRelocationGraph(Target::S390X, Endianness::Big, 22, 8,
                                          0x2000, 0x1000, 0, -8);
   ASSERT_TRUE(applyRelocations(Absolute));
@@ -4451,6 +4534,8 @@ TEST(RelocationTest, RejectsGeneratedRebaseOverlapForEveryAbsoluteWriter) {
       {Target::S390X, Endianness::Big, 22, 8},
   }};
   for (const auto &Test : Cases) {
+    if (!hasRelocationHandler(Test.Architecture))
+      continue;
     auto Graph = makeELFRelocationGraph(Test.Architecture, Test.Endian,
                                         Test.Type, Test.Width, 0x2000);
     ASSERT_TRUE(Graph.addRebase(Rebase{0, 0, Test.Type, 0, Test.Width}));
@@ -4461,6 +4546,7 @@ TEST(RelocationTest, RejectsGeneratedRebaseOverlapForEveryAbsoluteWriter) {
 }
 
 TEST(S390XRelocationTest, ChecksDoubledDisplacementRangeAndAlignment) {
+  REQUIRE_LINUX_RELOCATIONS();
   struct Case {
     int64_t Delta;
     bool Accepted;
@@ -4541,6 +4627,8 @@ TEST(RelocationTest, ReadsAndRelocatesGeneratedLinuxObjectsForEveryTarget) {
        {llvm::ELF::R_390_PC32DBL, llvm::ELF::R_390_PLT32DBL}},
   }};
   for (const auto &Test : Cases) {
+    if (!hasRelocationHandler(Test.Architecture))
+      continue;
     bool Available;
     checkLLVMTarget(llvm::Triple(Test.Triple), Available);
     if (!Available)
@@ -4669,9 +4757,11 @@ TEST(RelocationTest, RejectsFailingGeneratedRelocationAtomically) {
     ASSERT_TRUE(Graph->addRelocation(
         Relocation{*Patch, 0, Test.AbsoluteType, *TargetSymbol, 1, false,
                    ObjectFormat::ELF, Test.Width}));
-    const auto Snapshot = *Graph;
-    EXPECT_FALSE(applyRelocations(*Graph)) << Test.Triple;
-    expectGraphStateEquals(*Graph, Snapshot);
+    if (hasRelocationHandler(Test.Architecture)) {
+      const auto Snapshot = *Graph;
+      EXPECT_FALSE(applyRelocations(*Graph)) << Test.Triple;
+      expectGraphStateEquals(*Graph, Snapshot);
+    }
 
     LinkGraph WrongEndianGraph(Test.Architecture, Test.WrongEndian);
     ASSERT_TRUE(WrongEndianGraph.beginInput("wrong-endian.o"));
@@ -7195,6 +7285,18 @@ TEST(ObjectReaderTest, PreservesRISCVArchitectureFlags) {
   const uint32_t Expected =
       llvm::ELF::EF_RISCV_RVC | llvm::ELF::EF_RISCV_FLOAT_ABI_DOUBLE;
   EXPECT_EQ(Graph->elfFlags(), Expected);
+}
+
+TEST(ObjectReaderTest, WritesRISCVArchitectureFlags) {
+  REQUIRE_LINUX_RELOCATIONS();
+  REQUIRE_LLVM_TARGET("riscv64-unknown-linux-gnu");
+  const auto Bytes = makeAssemblyObject(
+      llvm::Triple("riscv64-unknown-linux-gnu"),
+      ".option rvc\n.text\n.globl f0\nf0:\n c.nop\n ret\n", "+c,+f,+d");
+  auto Graph = ObjectReader::read(Bytes, Target::RISCV64);
+  ASSERT_TRUE(Graph);
+  const uint32_t Expected =
+      llvm::ELF::EF_RISCV_RVC | llvm::ELF::EF_RISCV_FLOAT_ABI_DOUBLE;
   ASSERT_TRUE(ELFWriter::layout(*Graph));
   ASSERT_TRUE(applyRelocations(*Graph));
   std::vector<WasmEdge::Byte> OutputBytes;
