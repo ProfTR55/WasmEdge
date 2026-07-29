@@ -1564,6 +1564,41 @@ TEST_F(LinkerOutputTest, NativeLinkerRejectsBadObjectsAtomically) {
   }
 }
 
+TEST_F(LinkerOutputTest, NativeLinkerRejectsConcatenatedCOFFAtomically) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  const auto Output = Directory / "existing.wasm";
+  const std::array<WasmEdge::Byte, 3> Sentinel{1, 2, 3};
+  constexpr std::array<WasmEdge::Byte, 8> EmptyWasm{0x00, 0x61, 0x73, 0x6D,
+                                                    0x01, 0x00, 0x00, 0x00};
+  const auto COFF = makeAssemblyObject(llvm::Triple("x86_64-pc-windows-msvc"),
+                                       ".text\nretq\n");
+  auto Concatenated = COFF;
+  Concatenated.insert(Concatenated.end(), COFF.begin(), COFF.end());
+  std::vector<std::vector<WasmEdge::Byte>> Invalid;
+#if WASMEDGE_OS_WINDOWS
+  REQUIRE_LLVM_TARGET("x86_64-unknown-linux-gnu");
+  Invalid.push_back(makeAssemblyObject(llvm::Triple("x86_64-unknown-linux-gnu"),
+                                       ".text\nretq\n"));
+#else
+  Invalid.push_back(COFF);
+#endif
+  Invalid.push_back(Concatenated);
+
+  for (const auto &Object : Invalid) {
+    {
+      std::ofstream File(Output, std::ios_base::binary | std::ios_base::trunc);
+      File.write(reinterpret_cast<const char *>(Sentinel.data()),
+                 Sentinel.size());
+      ASSERT_TRUE(File);
+    }
+    EXPECT_FALSE(NativeLinker::link(Object, EmptyWasm, Output,
+                                    OutputKind::UniversalWasm));
+    EXPECT_EQ(readFile(Output),
+              (std::vector<WasmEdge::Byte>(Sentinel.begin(), Sentinel.end())));
+    expectNoTemporaryFiles();
+  }
+}
+
 TEST_F(LinkerOutputTest, NativeLinkerRejectsUnsupportedInputsAtomically) {
   const auto Output = Directory / "existing.wasm";
   const std::array<WasmEdge::Byte, 3> Sentinel{1, 2, 3};
@@ -6566,6 +6601,279 @@ TEST(ObjectReaderTest, ParsesCOFFExportDirectives) {
 TEST(ObjectReaderTest, RejectsMalformedCOFFExportDirectives) {
   EXPECT_FALSE(Internal::parseCOFFExports("/EXPORT:"));
   EXPECT_FALSE(Internal::parseCOFFExports("\"/EXPORT:f0"));
+}
+
+TEST(ObjectReaderTest, RejectsConcatenatedCOFFObject) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  const auto Object = makeObject(llvm::Triple("x86_64-pc-windows-msvc"));
+  auto Concatenated = Object;
+  Concatenated.insert(Concatenated.end(), Object.begin(), Object.end());
+  auto PaddedConcatenated = Object;
+  PaddedConcatenated.insert(PaddedConcatenated.end(), 16, 0);
+  PaddedConcatenated.insert(PaddedConcatenated.end(), Object.begin(),
+                            Object.end());
+  auto Padded = Object;
+  Padded.insert(Padded.end(), 16, 0);
+
+  EXPECT_FALSE(ObjectReader::read(Concatenated, Target::X86_64));
+  EXPECT_FALSE(ObjectReader::read(PaddedConcatenated, Target::X86_64));
+  EXPECT_TRUE(ObjectReader::read(Padded, Target::X86_64));
+}
+
+TEST(ObjectReaderTest,
+     IgnoresUnusedCOFFTablePointersWhenFindingTrailingObject) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  auto Object = makeObject(llvm::Triple("x86_64-pc-windows-msvc"));
+  auto Parsed =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Object.data()),
+                          Object.size()),
+          "test.o"));
+  ASSERT_TRUE(static_cast<bool>(Parsed));
+  const auto *COFF = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Parsed);
+  ASSERT_NE(COFF, nullptr);
+  bool Mutated = false;
+  for (const auto &Section : COFF->sections()) {
+    const auto *Header = COFF->getCOFFSection(Section);
+    if (Header->NumberOfRelocations != 0 || Header->NumberOfLinenumbers != 0)
+      continue;
+    const auto Offset = reinterpret_cast<const WasmEdge::Byte *>(Header) -
+                        reinterpret_cast<const WasmEdge::Byte *>(Object.data());
+    write32le(Object, static_cast<size_t>(Offset) + 24, UINT32_MAX);
+    write32le(Object, static_cast<size_t>(Offset) + 28, UINT32_MAX);
+    Mutated = true;
+    break;
+  }
+  ASSERT_TRUE(Mutated);
+  auto Concatenated = Object;
+  Concatenated.insert(Concatenated.end(), Object.begin(), Object.end());
+
+  EXPECT_FALSE(ObjectReader::read(Concatenated, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, IgnoresCOFFVirtualSectionRawSizeForTrailingObject) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  auto Object = makeObject(llvm::Triple("x86_64-pc-windows-msvc"));
+  const auto Trailing = Object;
+  auto Parsed =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Object.data()),
+                          Object.size()),
+          "test.o"));
+  ASSERT_TRUE(static_cast<bool>(Parsed));
+  const auto *COFF = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Parsed);
+  ASSERT_NE(COFF, nullptr);
+  bool Mutated = false;
+  for (const auto &Section : COFF->sections()) {
+    const auto *Header = COFF->getCOFFSection(Section);
+    if (Header->PointerToRawData != 0)
+      continue;
+    const auto Offset = reinterpret_cast<const WasmEdge::Byte *>(Header) -
+                        reinterpret_cast<const WasmEdge::Byte *>(Object.data());
+    write32le(Object, static_cast<size_t>(Offset) + 16, UINT32_MAX);
+    Mutated = true;
+    break;
+  }
+  ASSERT_TRUE(Mutated);
+  EXPECT_TRUE(ObjectReader::read(Object, Target::X86_64));
+
+  Object.insert(Object.end(), Trailing.begin(), Trailing.end());
+  EXPECT_FALSE(ObjectReader::read(Object, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, ValidatesCOFFRelocationOverflowConvention) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  constexpr uint32_t RelocationCount = UINT16_MAX;
+  constexpr size_t RelocationSize = 10;
+  auto MakeObject = [] {
+    auto Object = makeAssemblyObject(llvm::Triple("x86_64-pc-windows-msvc"),
+                                     ".text\nretq\n");
+    auto Parsed =
+        llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+            llvm::StringRef(reinterpret_cast<const char *>(Object.data()),
+                            Object.size()),
+            "test.o"));
+    EXPECT_TRUE(static_cast<bool>(Parsed));
+    if (!Parsed) {
+      llvm::consumeError(Parsed.takeError());
+      return std::pair{std::move(Object), size_t{0}};
+    }
+    const auto *COFF = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Parsed);
+    EXPECT_NE(COFF, nullptr);
+    if (COFF == nullptr || COFF->section_begin() == COFF->section_end())
+      return std::pair{std::move(Object), size_t{0}};
+    const auto *Header = COFF->getCOFFSection(*COFF->section_begin());
+    const auto Section = static_cast<size_t>(
+        reinterpret_cast<const WasmEdge::Byte *>(Header) - Object.data());
+    Object.resize(read32le(Object, 8));
+    write32le(Object, 12, 0);
+    write32le(Object, Section + 36, 0);
+    return std::pair{std::move(Object), Section};
+  };
+
+  auto [MismatchedFlag, MismatchedSection] = MakeObject();
+  ASSERT_NE(MismatchedSection, 0U);
+  write32le(MismatchedFlag, MismatchedSection + 36,
+            llvm::COFF::IMAGE_SCN_LNK_NRELOC_OVFL);
+  EXPECT_FALSE(ObjectReader::read(MismatchedFlag, Target::X86_64));
+
+  auto [SmallExtended, ExtendedSection] = MakeObject();
+  ASSERT_NE(ExtendedSection, 0U);
+  const uint32_t ExtendedTable = static_cast<uint32_t>(SmallExtended.size());
+  SmallExtended.resize(SmallExtended.size() + RelocationCount * RelocationSize);
+  write32le(SmallExtended, ExtendedSection + 24, ExtendedTable);
+  SmallExtended[ExtendedSection + 32] = 0xFF;
+  SmallExtended[ExtendedSection + 33] = 0xFF;
+  write32le(SmallExtended, ExtendedSection + 36,
+            llvm::COFF::IMAGE_SCN_LNK_NRELOC_OVFL);
+  write32le(SmallExtended, ExtendedTable, RelocationCount);
+  EXPECT_FALSE(ObjectReader::read(SmallExtended, Target::X86_64));
+
+  auto [Ordinary, OrdinarySection] = MakeObject();
+  ASSERT_NE(OrdinarySection, 0U);
+  const auto Trailing = Ordinary;
+  const uint32_t OrdinaryTable = static_cast<uint32_t>(Ordinary.size());
+  Ordinary.resize(Ordinary.size() + RelocationCount * RelocationSize);
+  write32le(Ordinary, OrdinarySection + 24, OrdinaryTable);
+  Ordinary[OrdinarySection + 32] = 0xFF;
+  Ordinary[OrdinarySection + 33] = 0xFF;
+  EXPECT_TRUE(ObjectReader::read(Ordinary, Target::X86_64));
+  Ordinary.insert(Ordinary.end(), Trailing.begin(), Trailing.end());
+  EXPECT_FALSE(ObjectReader::read(Ordinary, Target::X86_64));
+}
+
+TEST(ObjectReaderTest,
+     IgnoresUnusedCOFFSymbolPointerWhenFindingTrailingObject) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  auto Object = makeAssemblyObject(llvm::Triple("x86_64-pc-windows-msvc"),
+                                   ".text\nretq\n");
+  const auto Trailing = Object;
+  Object.resize(read32le(Object, 8));
+  write32le(Object, 8, UINT32_MAX);
+  write32le(Object, 12, 0);
+  EXPECT_TRUE(ObjectReader::read(Object, Target::X86_64));
+
+  Object.insert(Object.end(), Trailing.begin(), Trailing.end());
+
+  EXPECT_FALSE(ObjectReader::read(Object, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, IncludesZeroSymbolCOFFStringTableInStructuralExtent) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  auto Object = makeAssemblyObject(llvm::Triple("x86_64-pc-windows-msvc"),
+                                   ".text\nretq\n");
+  const auto Embedded = Object;
+  const auto SymbolTable = read32le(Object, 8);
+  Object.resize(SymbolTable);
+  write32le(Object, 12, 0);
+  const uint32_t StringTableSize =
+      static_cast<uint32_t>(sizeof(uint32_t) + Embedded.size() + 1);
+  Object.resize(SymbolTable + StringTableSize);
+  write32le(Object, SymbolTable, StringTableSize);
+  std::copy(Embedded.begin(), Embedded.end(),
+            Object.begin() + SymbolTable + sizeof(uint32_t));
+  EXPECT_TRUE(ObjectReader::read(Object, Target::X86_64));
+
+  Object.insert(Object.end(), Embedded.begin(), Embedded.end());
+  EXPECT_FALSE(ObjectReader::read(Object, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, RejectsConcatenatedCOFFBigObj) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  auto Normal = makeAssemblyObject(llvm::Triple("x86_64-pc-windows-msvc"),
+                                   ".text\nretq\n");
+  const uint16_t SectionCount =
+      static_cast<uint16_t>(Normal[2] | static_cast<uint16_t>(Normal[3]) << 8);
+  const uint32_t SymbolTable = read32le(Normal, 8);
+  const uint32_t SymbolCount = read32le(Normal, 12);
+  ASSERT_GT(SymbolCount, 0U);
+  ASSERT_LE(SymbolCount,
+            (Normal.size() - static_cast<size_t>(SymbolTable)) / 18);
+  const size_t StringTable =
+      SymbolTable + static_cast<size_t>(SymbolCount) * 18;
+  constexpr size_t HeaderGrowth = 36;
+  constexpr size_t SymbolGrowth = 2;
+  const size_t BigSymbolTable = SymbolTable + HeaderGrowth;
+  std::vector<WasmEdge::Byte> BigObj(Normal.size() + HeaderGrowth +
+                                     SymbolCount * SymbolGrowth);
+  std::copy(Normal.begin() + 20, Normal.begin() + SymbolTable,
+            BigObj.begin() + 56);
+  BigObj[2] = 0xFF;
+  BigObj[3] = 0xFF;
+  BigObj[4] = 2;
+  BigObj[6] = Normal[0];
+  BigObj[7] = Normal[1];
+  std::copy(std::begin(llvm::COFF::BigObjMagic),
+            std::end(llvm::COFF::BigObjMagic), BigObj.begin() + 12);
+  write32le(BigObj, 44, SectionCount);
+  write32le(BigObj, 48, static_cast<uint32_t>(BigSymbolTable));
+  write32le(BigObj, 52, SymbolCount);
+  for (uint16_t I = 0; I < SectionCount; ++I) {
+    const size_t Section = 56 + static_cast<size_t>(I) * 40;
+    for (const size_t Pointer : {size_t{20}, size_t{24}, size_t{28}}) {
+      const uint32_t Value = read32le(BigObj, Section + Pointer);
+      if (Value != 0)
+        write32le(BigObj, Section + Pointer, Value + HeaderGrowth);
+    }
+  }
+  for (uint32_t I = 0; I < SymbolCount;) {
+    const size_t Input = SymbolTable + static_cast<size_t>(I) * 18;
+    const size_t Output = BigSymbolTable + static_cast<size_t>(I) * 20;
+    std::copy_n(Normal.begin() + Input, 12, BigObj.begin() + Output);
+    const int16_t Section =
+        static_cast<int16_t>(static_cast<uint16_t>(Normal[Input + 12]) |
+                             static_cast<uint16_t>(Normal[Input + 13]) << 8);
+    write32le(BigObj, Output + 12, static_cast<uint32_t>(Section));
+    std::copy_n(Normal.begin() + Input + 14, 4, BigObj.begin() + Output + 16);
+    const uint8_t AuxCount = Normal[Input + 17];
+    ASSERT_LE(AuxCount, SymbolCount - I - 1);
+    for (uint8_t J = 0; J < AuxCount; ++J) {
+      std::copy_n(Normal.begin() + Input + (J + 1) * 18, 18,
+                  BigObj.begin() + Output + (J + 1) * 20);
+    }
+    I += 1 + AuxCount;
+  }
+  std::copy(Normal.begin() + StringTable, Normal.end(),
+            BigObj.begin() + BigSymbolTable +
+                static_cast<size_t>(SymbolCount) * 20);
+  auto Parsed =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(BigObj.data()),
+                          BigObj.size()),
+          "bigobj.o"));
+  ASSERT_TRUE(static_cast<bool>(Parsed));
+  const auto *COFF = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Parsed);
+  ASSERT_NE(COFF, nullptr);
+  ASSERT_NE(COFF->getCOFFBigObjHeader(), nullptr);
+  EXPECT_EQ(COFF->getNumberOfSymbols(), SymbolCount);
+  ASSERT_TRUE(ObjectReader::read(BigObj, Target::X86_64));
+  const auto Trailing = BigObj;
+  BigObj.insert(BigObj.end(), Trailing.begin(), Trailing.end());
+
+  EXPECT_FALSE(ObjectReader::read(BigObj, Target::X86_64));
+}
+
+TEST(ObjectReaderTest, RejectsMalformedCOFFStructuralMetadata) {
+  REQUIRE_LLVM_TARGET("x86_64-pc-windows-msvc");
+  auto Object = makeObject(llvm::Triple("x86_64-pc-windows-msvc"));
+  auto Parsed =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Object.data()),
+                          Object.size()),
+          "test.o"));
+  ASSERT_TRUE(static_cast<bool>(Parsed));
+  const auto *COFF = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Parsed);
+  ASSERT_NE(COFF, nullptr);
+  const auto Section = COFF->section_begin();
+  ASSERT_NE(Section, COFF->section_end());
+  const auto *Header = COFF->getCOFFSection(*Section);
+  const auto Offset = reinterpret_cast<const WasmEdge::Byte *>(Header) -
+                      reinterpret_cast<const WasmEdge::Byte *>(Object.data());
+  write32le(Object, static_cast<size_t>(Offset) + 24, UINT32_MAX);
+  Object[static_cast<size_t>(Offset) + 32] = 1;
+  Object[static_cast<size_t>(Offset) + 33] = 0;
+
+  EXPECT_FALSE(ObjectReader::read(Object, Target::X86_64));
 }
 
 TEST(ObjectReaderTest, NormalizesX86_64ELFRelaObject) {

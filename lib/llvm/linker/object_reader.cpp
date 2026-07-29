@@ -20,6 +20,7 @@
 #include <llvm/BinaryFormat/COFF.h>
 #include <llvm/BinaryFormat/ELF.h>
 #include <llvm/BinaryFormat/MachO.h>
+#include <llvm/BinaryFormat/Magic.h>
 #include <llvm/Config/llvm-config.h>
 #include <llvm/Object/COFF.h>
 #include <llvm/Object/ELFObjectFile.h>
@@ -226,6 +227,203 @@ bool hasTrailingELFObject(Span<const Byte> Buffer,
          Buffer[End + 1] == llvm::ELF::ElfMagic[1] &&
          Buffer[End + 2] == llvm::ELF::ElfMagic[2] &&
          Buffer[End + 3] == llvm::ELF::ElfMagic[3];
+}
+
+enum class COFFTrailingObject { None, Found, Malformed };
+
+COFFTrailingObject
+findTrailingCOFFObject(Span<const Byte> Buffer,
+                       const llvm::object::ObjectFile &Object) noexcept {
+  constexpr uint64_t COFFHeaderSize = 20;
+  constexpr uint64_t BigObjHeaderSize = 56;
+  constexpr uint64_t SectionSize = 40;
+  constexpr uint64_t RelocationSize = 10;
+  constexpr uint64_t LineNumberSize = 6;
+  constexpr uint64_t SymbolSize = 18;
+  constexpr uint64_t BigObjSymbolSize = 20;
+  constexpr uint64_t BigObjMagicOffset = 12;
+  constexpr uint64_t SectionRawSizeOffset = 16;
+  constexpr uint64_t SectionRawDataOffset = 20;
+  constexpr uint64_t SectionRelocationOffset = 24;
+  constexpr uint64_t SectionLineNumberOffset = 28;
+  constexpr uint64_t SectionRelocationCountOffset = 32;
+  constexpr uint64_t SectionLineNumberCountOffset = 34;
+  constexpr uint64_t SectionCharacteristicsOffset = 36;
+  constexpr uint64_t RelocationCountOffset = 0;
+  constexpr uint16_t BigObjSignature = UINT16_MAX;
+  constexpr uint16_t MinimumBigObjVersion = 2;
+  constexpr uint16_t OverflowRelocationCount = UINT16_MAX;
+
+  if (!Object.isCOFF()) {
+    return COFFTrailingObject::None;
+  }
+  if (Buffer.size() < COFFHeaderSize) {
+    return COFFTrailingObject::Malformed;
+  }
+  auto read16 = [&](uint64_t Offset, uint16_t &Value) noexcept {
+    return readELFInteger(Buffer, Offset, true, Value);
+  };
+  auto read32 = [&](uint64_t Offset, uint32_t &Value) noexcept {
+    return readELFInteger(Buffer, Offset, true, Value);
+  };
+  auto extend = [&](uint64_t Offset, uint64_t Count, uint64_t Width,
+                    uint64_t &End) noexcept {
+    if (Count == 0) {
+      return true;
+    }
+    if (Offset > Buffer.size() || Count > (Buffer.size() - Offset) / Width) {
+      return false;
+    }
+    End = std::max(End, Offset + Count * Width);
+    return true;
+  };
+
+  uint16_t Signature1 = 0;
+  uint16_t Signature2 = 0;
+  uint16_t BigObjVersion = 0;
+  if (!read16(0, Signature1) || !read16(2, Signature2) ||
+      !read16(4, BigObjVersion)) {
+    return COFFTrailingObject::Malformed;
+  }
+  bool IsBigObj = Signature1 == llvm::COFF::IMAGE_FILE_MACHINE_UNKNOWN &&
+                  Signature2 == BigObjSignature &&
+                  BigObjVersion >= MinimumBigObjVersion &&
+                  Buffer.size() >= BigObjHeaderSize;
+  if (IsBigObj) {
+    for (size_t I = 0; I < sizeof(llvm::COFF::BigObjMagic); ++I) {
+      if (Buffer[BigObjMagicOffset + I] !=
+          static_cast<Byte>(llvm::COFF::BigObjMagic[I])) {
+        IsBigObj = false;
+        break;
+      }
+    }
+  }
+
+  uint64_t HeaderSize = COFFHeaderSize;
+  uint64_t SectionCount = 0;
+  uint64_t SymbolTable = 0;
+  uint64_t SymbolCount = 0;
+  uint64_t InputSymbolSize = SymbolSize;
+  if (IsBigObj) {
+    uint32_t Value = 0;
+    if (!read32(44, Value)) {
+      return COFFTrailingObject::Malformed;
+    }
+    SectionCount = Value;
+    if (!read32(48, Value)) {
+      return COFFTrailingObject::Malformed;
+    }
+    SymbolTable = Value;
+    if (!read32(52, Value)) {
+      return COFFTrailingObject::Malformed;
+    }
+    SymbolCount = Value;
+    HeaderSize = BigObjHeaderSize;
+    InputSymbolSize = BigObjSymbolSize;
+  } else {
+    uint16_t Sections = 0;
+    uint16_t OptionalHeaderSize = 0;
+    uint32_t Value = 0;
+    if (!read16(2, Sections) || !read32(8, Value)) {
+      return COFFTrailingObject::Malformed;
+    }
+    SectionCount = Sections;
+    SymbolTable = Value;
+    if (!read32(12, Value) || !read16(16, OptionalHeaderSize)) {
+      return COFFTrailingObject::Malformed;
+    }
+    SymbolCount = Value;
+    HeaderSize += OptionalHeaderSize;
+  }
+
+  uint64_t End = HeaderSize;
+  if (!extend(HeaderSize, SectionCount, SectionSize, End)) {
+    return COFFTrailingObject::Malformed;
+  }
+  for (uint64_t I = 0; I < SectionCount; ++I) {
+    const uint64_t Section = HeaderSize + I * SectionSize;
+    uint32_t RawSize = 0;
+    uint32_t RawData = 0;
+    uint32_t Relocations = 0;
+    uint32_t LineNumbers = 0;
+    uint32_t Characteristics = 0;
+    uint16_t RelocationCount = 0;
+    uint16_t LineNumberCount = 0;
+    if (!read32(Section + SectionRawSizeOffset, RawSize) ||
+        !read32(Section + SectionRawDataOffset, RawData) ||
+        !read32(Section + SectionRelocationOffset, Relocations) ||
+        !read32(Section + SectionLineNumberOffset, LineNumbers) ||
+        !read16(Section + SectionRelocationCountOffset, RelocationCount) ||
+        !read16(Section + SectionLineNumberCountOffset, LineNumberCount) ||
+        !read32(Section + SectionCharacteristicsOffset, Characteristics) ||
+        (RawData != 0 && !extend(RawData, RawSize, 1, End))) {
+      return COFFTrailingObject::Malformed;
+    }
+    uint64_t ActualRelocationCount = RelocationCount;
+    const bool HasOverflow =
+        (Characteristics & llvm::COFF::IMAGE_SCN_LNK_NRELOC_OVFL) != 0;
+    if (HasOverflow && RelocationCount != OverflowRelocationCount) {
+      return COFFTrailingObject::Malformed;
+    }
+    if (HasOverflow) {
+      uint32_t ExtendedCount = 0;
+      if (!read32(Relocations + RelocationCountOffset, ExtendedCount) ||
+          ExtendedCount < UINT32_C(0x10000)) {
+        return COFFTrailingObject::Malformed;
+      }
+      ActualRelocationCount = ExtendedCount;
+    }
+    if (!extend(Relocations, ActualRelocationCount, RelocationSize, End) ||
+        !extend(LineNumbers, LineNumberCount, LineNumberSize, End)) {
+      return COFFTrailingObject::Malformed;
+    }
+  }
+  if (SymbolCount != 0) {
+    if (SymbolTable > Buffer.size() ||
+        SymbolCount > (Buffer.size() - SymbolTable) / InputSymbolSize) {
+      return COFFTrailingObject::Malformed;
+    }
+    const uint64_t SymbolEnd = SymbolTable + SymbolCount * InputSymbolSize;
+    End = std::max(End, SymbolEnd);
+    uint32_t StringTableSize = 0;
+    if (!read32(SymbolEnd, StringTableSize) ||
+        !extend(SymbolEnd,
+                std::max<uint32_t>(StringTableSize, sizeof(uint32_t)), 1,
+                End)) {
+      return COFFTrailingObject::Malformed;
+    }
+  } else if (SymbolTable != 0) {
+    uint32_t StringTableSize = 0;
+    uint64_t StringTableEnd = End;
+    if (read32(SymbolTable, StringTableSize) &&
+        extend(SymbolTable,
+               std::max<uint32_t>(StringTableSize, sizeof(uint32_t)), 1,
+               StringTableEnd)) {
+      End = StringTableEnd;
+    }
+  }
+  if (End >= Buffer.size()) {
+    return COFFTrailingObject::None;
+  }
+  for (uint64_t Offset = End; Offset <= Buffer.size() - COFFHeaderSize;
+       ++Offset) {
+    const auto TrailingData =
+        llvm::StringRef(reinterpret_cast<const char *>(Buffer.data() + Offset),
+                        Buffer.size() - Offset);
+    if (llvm::identify_magic(TrailingData) != llvm::file_magic::coff_object) {
+      continue;
+    }
+    auto TrailingObject = llvm::object::ObjectFile::createObjectFile(
+        llvm::MemoryBufferRef(TrailingData, "trailing object"));
+    if (!TrailingObject) {
+      llvm::consumeError(TrailingObject.takeError());
+      continue;
+    }
+    if ((*TrailingObject)->isCOFF()) {
+      return COFFTrailingObject::Found;
+    }
+  }
+  return COFFTrailingObject::None;
 }
 
 bool validELFRelocations(Span<const Byte> Buffer) noexcept {
@@ -798,7 +996,12 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
     return Unexpect(ErrCode::Value::IllegalPath);
   }
   const auto &Object = **ObjectResult;
-  if (hasTrailingELFObject(Buffer, Object)) {
+  const auto TrailingCOFF = findTrailingCOFFObject(Buffer, Object);
+  if (TrailingCOFF == COFFTrailingObject::Malformed) {
+    return fail<LinkGraph>("malformed COFF structural metadata");
+  }
+  if (hasTrailingELFObject(Buffer, Object) ||
+      TrailingCOFF == COFFTrailingObject::Found) {
     return fail<LinkGraph>("multiple input objects are not supported");
   }
   if (!Object.isRelocatableObject()) {
