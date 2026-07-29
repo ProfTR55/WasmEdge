@@ -9,7 +9,9 @@
 #include <array>
 #include <cassert>
 #include <cstring>
+#include <map>
 #include <numeric>
+#include <optional>
 #include <tuple>
 #include <vector>
 
@@ -145,35 +147,67 @@ std::optional<std::vector<Byte>> exportTrie(const LinkGraph &Graph) {
   for (size_t I = 1; I < Exports.size(); ++I)
     if (Exports[I - 1].Name == Exports[I].Name)
       return std::nullopt;
-  if (Exports.size() > UINT8_MAX)
-    return std::nullopt;
-  size_t RootSize = 2;
-  for (const auto &Value : Exports)
-    RootSize += Value.Name.size() + 1 + 1;
-  for (;;) {
-    size_t Cursor = RootSize;
-    size_t NewRootSize = 2;
-    for (const auto &Value : Exports) {
-      NewRootSize += Value.Name.size() + 1 + ulebSize(Cursor);
-      Cursor += 3 + ulebSize(Value.Address);
+  struct Node {
+    std::optional<uint64_t> Address;
+    std::map<Byte, size_t> Children;
+  };
+  std::vector<Node> Nodes(1);
+  for (const auto &Value : Exports) {
+    if (Value.Name.empty() || Value.Name.find('\0') != Value.Name.npos)
+      return std::nullopt;
+    size_t NodeIndex = 0;
+    for (const char Character : Value.Name) {
+      const Byte Edge = static_cast<Byte>(Character);
+      auto Child = Nodes[NodeIndex].Children.find(Edge);
+      if (Child == Nodes[NodeIndex].Children.end()) {
+        const size_t NewIndex = Nodes.size();
+        Nodes.emplace_back();
+        Nodes[NodeIndex].Children.emplace(Edge, NewIndex);
+        NodeIndex = NewIndex;
+      } else {
+        NodeIndex = Child->second;
+      }
     }
-    if (NewRootSize == RootSize)
+    Nodes[NodeIndex].Address = Value.Address;
+  }
+
+  std::vector<size_t> Offsets(Nodes.size());
+  for (;;) {
+    std::vector<size_t> NewOffsets(Nodes.size());
+    size_t Cursor = 0;
+    for (size_t I = 0; I < Nodes.size(); ++I) {
+      NewOffsets[I] = Cursor;
+      const auto &NodeValue = Nodes[I];
+      const size_t TerminalSize =
+          NodeValue.Address ? 1 + ulebSize(*NodeValue.Address) : 0;
+      Cursor += ulebSize(TerminalSize) + TerminalSize + 1;
+      for (const auto &[Edge, Child] : NodeValue.Children) {
+        static_cast<void>(Edge);
+        Cursor += 2 + ulebSize(Offsets[Child]);
+      }
+    }
+    if (NewOffsets == Offsets)
       break;
-    RootSize = NewRootSize;
+    Offsets = std::move(NewOffsets);
   }
-  std::vector<Byte> Result{0, static_cast<Byte>(Exports.size())};
-  size_t Cursor = RootSize;
-  for (const auto &Value : Exports) {
-    Result.insert(Result.end(), Value.Name.begin(), Value.Name.end());
-    Result.push_back(0);
-    appendULEB(Result, Cursor);
-    Cursor += 3 + ulebSize(Value.Address);
-  }
-  for (const auto &Value : Exports) {
-    Result.push_back(static_cast<Byte>(1 + ulebSize(Value.Address)));
-    Result.push_back(llvm::MachO::EXPORT_SYMBOL_FLAGS_KIND_REGULAR);
-    appendULEB(Result, Value.Address);
-    Result.push_back(0);
+
+  std::vector<Byte> Result;
+  for (const auto &NodeValue : Nodes) {
+    const size_t TerminalSize =
+        NodeValue.Address ? 1 + ulebSize(*NodeValue.Address) : 0;
+    appendULEB(Result, TerminalSize);
+    if (NodeValue.Address) {
+      Result.push_back(llvm::MachO::EXPORT_SYMBOL_FLAGS_KIND_REGULAR);
+      appendULEB(Result, *NodeValue.Address);
+    }
+    if (NodeValue.Children.size() > UINT8_MAX)
+      return std::nullopt;
+    Result.push_back(static_cast<Byte>(NodeValue.Children.size()));
+    for (const auto &[Edge, Child] : NodeValue.Children) {
+      Result.push_back(Edge);
+      Result.push_back(0);
+      appendULEB(Result, Offsets[Child]);
+    }
   }
   return Result;
 }

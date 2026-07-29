@@ -238,12 +238,15 @@ void readExportNode(const std::vector<WasmEdge::Byte> &Bytes, size_t Base,
   Offset = TerminalEnd;
   ASSERT_LT(Offset, End);
   const uint8_t ChildCount = Bytes[Offset++];
+  std::set<char> ChildPrefixes;
   for (uint8_t I = 0; I < ChildCount; ++I) {
     std::string Suffix;
     while (Offset < End && Bytes[Offset] != 0)
       Suffix.push_back(static_cast<char>(Bytes[Offset++]));
     ASSERT_LT(Offset, End);
     ++Offset;
+    ASSERT_FALSE(Suffix.empty());
+    EXPECT_TRUE(ChildPrefixes.insert(Suffix.front()).second);
     const uint64_t Child = readULEB(Bytes, Offset, End);
     ASSERT_LT(Child, End - Base);
     readExportNode(Bytes, Base, Base + Child, End, Prefix + Suffix, Exports,
