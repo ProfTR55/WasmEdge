@@ -476,13 +476,18 @@ TEST(PEWriterTest, OmitsRelocationsWhenImageHasNoRebases) {
   EXPECT_EQ(findSection(*PE, ".reloc", Storage), nullptr);
   const auto *Header = PE->getPE32PlusHeader();
   ASSERT_NE(Header, nullptr);
+  const auto *COFFHeader = PE->getCOFFHeader();
+  ASSERT_NE(COFFHeader, nullptr);
+  EXPECT_EQ(
+      COFFHeader->Characteristics & llvm::COFF::IMAGE_FILE_RELOCS_STRIPPED, 0U);
   const size_t Optional = readInteger(Bytes, 0x3C, 4, Endianness::Little) + 24;
   EXPECT_EQ(readInteger(Bytes, Optional + 112 + 5 * 8, 8, Endianness::Little),
             0U);
   EXPECT_EQ(Header->DLLCharacteristics &
                 (llvm::COFF::IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE |
                  llvm::COFF::IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA),
-            0U);
+            llvm::COFF::IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE |
+                llvm::COFF::IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA);
 }
 
 TEST(PEWriterTest, RejectsInvalidRebasesAndOverflowAtomically) {
@@ -835,7 +840,8 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
           static_cast<uint32_t>(readInteger(Bytes, Offset, 4, Test.Endian));
       const uint32_t Flags = static_cast<uint32_t>(
           readInteger(Bytes, Offset + (Test.Is64 ? 4 : 24), 4, Test.Endian));
-      HasDynamic |= Type == llvm::ELF::PT_DYNAMIC;
+      HasDynamic |= Type == llvm::ELF::PT_DYNAMIC &&
+                    Flags == (llvm::ELF::PF_R | llvm::ELF::PF_W);
       HasEHFrame |= Type == llvm::ELF::PT_GNU_EH_FRAME;
       HasNonExecutableStack |=
           Type == llvm::ELF::PT_GNU_STACK && (Flags & llvm::ELF::PF_X) == 0;
@@ -868,6 +874,9 @@ TEST(ELFWriterTest, WritesLoadableImagesForEveryLinuxTarget) {
     const auto *DynamicSection =
         findSection(**Object, ".dynamic", DynamicStorage);
     ASSERT_NE(DynamicSection, nullptr);
+    EXPECT_NE(llvm::object::ELFSectionRef(*DynamicSection).getFlags() &
+                  llvm::ELF::SHF_WRITE,
+              0U);
     auto DynamicContent = DynamicSection->getContents();
     ASSERT_TRUE(static_cast<bool>(DynamicContent));
     std::map<uint64_t, uint64_t> DynamicTags;

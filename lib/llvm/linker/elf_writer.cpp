@@ -886,9 +886,10 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
     AddDynamic(llvm::ELF::DT_NULL, 0);
     const uint32_t DynamicSectionIndex = static_cast<uint32_t>(Sections.size());
     Sections.push_back(
-        OutputSection{".dynamic", llvm::ELF::SHT_DYNAMIC, llvm::ELF::SHF_ALLOC,
-                      Cursor, Cursor, Dynamic.size(), DynStrIndex, 0,
-                      AddressSize, DynamicSize, std::move(Dynamic)});
+        OutputSection{".dynamic", llvm::ELF::SHT_DYNAMIC,
+                      llvm::ELF::SHF_ALLOC | llvm::ELF::SHF_WRITE, Cursor,
+                      Cursor, Dynamic.size(), DynStrIndex, 0, AddressSize,
+                      DynamicSize, std::move(Dynamic)});
     if (!boundedAdd(Cursor, Sections.back().Size, ClassMaximum, Cursor))
       return fail();
 
@@ -988,7 +989,8 @@ Expect<void> ELFWriter::write(const LinkGraph &Graph, Writer &Output) noexcept {
             Segments.back().MemorySize, MemoryEnd - Segments.back().Address);
       }
     }
-    Segments.push_back({llvm::ELF::PT_DYNAMIC, llvm::ELF::PF_R, DynamicAddress,
+    Segments.push_back({llvm::ELF::PT_DYNAMIC,
+                        llvm::ELF::PF_R | llvm::ELF::PF_W, DynamicAddress,
                         DynamicAddress, Sections[DynamicSectionIndex].Size,
                         Sections[DynamicSectionIndex].Size, AddressSize});
     if (EHHeaderIndex != 0)

@@ -1356,7 +1356,8 @@ TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
       0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
       0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
   const auto Output = Directory / "native.dylib";
-  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
+  const auto Object =
+      compileTinyObject(TinyWasm, Directory / "seed.wasm", true);
   auto Input =
       ObjectReader::read(Object, nativeTarget(), ObjectReaderPolicy::Universal);
   ASSERT_TRUE(Input);
@@ -1394,7 +1395,8 @@ TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
     EXPECT_EQ(*Flags & llvm::object::SymbolRef::SF_Undefined, 0U);
     Symbols.emplace(Name->str());
   }
-  for (const char *Name : {"_f0", "_version", "_intrinsics"})
+  for (const char *Name :
+       {"_f0", "_version", "_intrinsics", "_wasm.code", "_wasm.size"})
     EXPECT_TRUE(Symbols.count(Name)) << Name;
   const auto Bytes = readFile(Output);
   size_t Command = sizeof(llvm::MachO::mach_header_64);
@@ -1426,9 +1428,13 @@ TEST_F(LinkerOutputTest, NativeMachOWriterLoadsAndExecutesSignedLibrary) {
         Library->get<const WasmEdge::Executable::IntrinsicsTable *>(
             "intrinsics");
     auto F0 = Library->get<WasmEdge::Executable::Wrapper>("f0");
+    auto WasmCode = Library->get<uint8_t>("wasm.code");
+    auto WasmSize = Library->get<uint32_t>("wasm.size");
     EXPECT_TRUE(Version);
     EXPECT_TRUE(Intrinsics);
     EXPECT_TRUE(F0);
+    EXPECT_TRUE(WasmCode);
+    EXPECT_TRUE(WasmSize);
   }
   EXPECT_EQ(execute(Output), 7U);
   Library->unload();
@@ -1443,7 +1449,8 @@ TEST_F(LinkerOutputTest, NativePEWriterLoadsAndExecutesWithoutImports) {
       0x00, 0x01, 0x7F, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66,
       0x00, 0x00, 0x0A, 0x06, 0x01, 0x04, 0x00, 0x41, 0x07, 0x0B};
   const auto Output = Directory / "native.dll";
-  const auto Object = compileTinyObject(TinyWasm, Directory / "seed.wasm");
+  const auto Object =
+      compileTinyObject(TinyWasm, Directory / "seed.wasm", true);
   ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Output, OutputKind::PE));
   auto Image = llvm::object::ObjectFile::createObjectFile(Output.string());
   ASSERT_TRUE(static_cast<bool>(Image));
@@ -1458,6 +1465,8 @@ TEST_F(LinkerOutputTest, NativePEWriterLoadsAndExecutesWithoutImports) {
   EXPECT_TRUE(Library->get<const WasmEdge::Executable::IntrinsicsTable *>(
       "intrinsics"));
   EXPECT_TRUE(Library->get<WasmEdge::Executable::Wrapper>("f0"));
+  EXPECT_TRUE(Library->get<uint8_t>("wasm.code"));
+  EXPECT_TRUE(Library->get<uint32_t>("wasm.size"));
   EXPECT_EQ(execute(Output), 7U);
 }
 #endif

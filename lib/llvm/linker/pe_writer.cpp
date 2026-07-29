@@ -558,10 +558,7 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
     put(Bytes, COFF + 18,
         llvm::COFF::IMAGE_FILE_EXECUTABLE_IMAGE |
             llvm::COFF::IMAGE_FILE_LARGE_ADDRESS_AWARE |
-            llvm::COFF::IMAGE_FILE_DLL |
-            (RelocSize == 0
-                 ? static_cast<uint32_t>(llvm::COFF::IMAGE_FILE_RELOCS_STRIPPED)
-                 : 0),
+            llvm::COFF::IMAGE_FILE_DLL,
         2);
     const size_t Optional = COFF + 20;
     put(Bytes, Optional, 0x20B, 2);
@@ -596,10 +593,8 @@ Expect<void> PEWriter::write(const LinkGraph &Graph, std::string_view DLLName,
     put(Bytes, Optional + 68, llvm::COFF::IMAGE_SUBSYSTEM_WINDOWS_CUI, 2);
     put(Bytes, Optional + 70,
         llvm::COFF::IMAGE_DLL_CHARACTERISTICS_NX_COMPAT |
-            (RelocSize == 0
-                 ? 0
-                 : llvm::COFF::IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA |
-                       llvm::COFF::IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE),
+            llvm::COFF::IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA |
+            llvm::COFF::IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE,
         2);
     put(Bytes, Optional + 72, UINT64_C(0x100000), 8);
     put(Bytes, Optional + 80, UINT64_C(0x1000), 8);
