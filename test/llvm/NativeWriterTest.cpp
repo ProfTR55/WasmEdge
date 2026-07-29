@@ -450,6 +450,41 @@ TEST(PEWriterTest, WritesDeterministicPE32PlusDLLs) {
   }
 }
 
+TEST(PEWriterTest, OmitsRelocationsWhenImageHasNoRebases) {
+  LinkGraph Graph(Target::X86_64, Endianness::Little, ObjectFormat::COFF);
+  ASSERT_TRUE(Graph.beginInput("writer.obj"));
+  auto Text = Graph.addSection(
+      Section{".text", SectionKind::Text, 16, 1, 0, 0, {0xC3}});
+  ASSERT_TRUE(Text);
+  ASSERT_TRUE(
+      Graph.addSymbol(Symbol{"f0", *Text, 0, 1, true, std::nullopt, true}));
+  ASSERT_TRUE(PEWriter::layout(Graph));
+  ASSERT_TRUE(applyRelocations(Graph));
+  std::vector<WasmEdge::Byte> Bytes;
+  Writer Output(Bytes);
+  ASSERT_TRUE(PEWriter::write(Graph, "writer.dll", Output));
+
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "writer.dll"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  const auto *PE = llvm::dyn_cast<llvm::object::COFFObjectFile>(&**Object);
+  ASSERT_NE(PE, nullptr);
+  llvm::object::SectionRef Storage;
+  EXPECT_EQ(findSection(*PE, ".reloc", Storage), nullptr);
+  const auto *Header = PE->getPE32PlusHeader();
+  ASSERT_NE(Header, nullptr);
+  const size_t Optional = readInteger(Bytes, 0x3C, 4, Endianness::Little) + 24;
+  EXPECT_EQ(readInteger(Bytes, Optional + 112 + 5 * 8, 8, Endianness::Little),
+            0U);
+  EXPECT_EQ(Header->DLLCharacteristics &
+                (llvm::COFF::IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE |
+                 llvm::COFF::IMAGE_DLL_CHARACTERISTICS_HIGH_ENTROPY_VA),
+            0U);
+}
+
 TEST(PEWriterTest, RejectsInvalidRebasesAndOverflowAtomically) {
   auto Graph = makePEGraph(Target::X86_64);
   ASSERT_TRUE(PEWriter::layout(Graph));
