@@ -1041,6 +1041,55 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
   std::map<uint64_t, SectionId> SectionIds;
   std::map<std::string, std::string> COFFExports;
   std::optional<uint64_t> CompactUnwindSection;
+  std::set<uint64_t> MachOFunctionSections;
+  if (Object.isMachO()) {
+    for (const auto &InputSymbol : Object.symbols()) {
+      llvm::object::SymbolRef::Type Type{};
+      uint32_t Flags = 0;
+      if (!take(InputSymbol.getType(), Type, "cannot read symbol type") ||
+          !symbolFlags(InputSymbol, Flags))
+        return Unexpect(ErrCode::Value::IllegalPath);
+      if (Type != llvm::object::SymbolRef::ST_Function &&
+          (Flags & llvm::object::SymbolRef::SF_Executable) == 0)
+        continue;
+      auto InputSection = InputSymbol.getSection();
+      if (!InputSection) {
+        llvm::consumeError(InputSection.takeError());
+        return fail<LinkGraph>("cannot read function symbol section");
+      }
+      if (*InputSection != Object.section_end())
+        MachOFunctionSections.emplace((*InputSection)->getIndex());
+    }
+    const auto *MachO = llvm::cast<llvm::object::MachOObjectFile>(&Object);
+    for (const auto &InputSection : Object.sections()) {
+      llvm::StringRef Name;
+      if (!take(InputSection.getName(), Name, "cannot read section name"))
+        return Unexpect(ErrCode::Value::IllegalPath);
+      if (sectionPurpose(Object, Name) != SectionPurpose::CompactUnwind)
+        continue;
+      for (const auto &Relocation : InputSection.relocations()) {
+        if (Relocation.getOffset() % CompactUnwindRecordSize !=
+            CompactUnwindFunctionOffset)
+          continue;
+        auto TargetSection = Object.section_end();
+        const auto InputSymbol = Relocation.getSymbol();
+        if (InputSymbol == Object.symbol_end()) {
+          TargetSection =
+              MachO->getRelocationSection(Relocation.getRawDataRefImpl());
+        } else {
+          auto SymbolSection = InputSymbol->getSection();
+          if (!SymbolSection) {
+            llvm::consumeError(SymbolSection.takeError());
+            return fail<LinkGraph>(
+                "cannot read compact unwind function section");
+          }
+          TargetSection = *SymbolSection;
+        }
+        if (TargetSection != Object.section_end())
+          MachOFunctionSections.emplace(TargetSection->getIndex());
+      }
+    }
+  }
   for (const auto &InputSection : Object.sections()) {
     llvm::StringRef Name;
     if (!take(InputSection.getName(), Name, "cannot read section name")) {
@@ -1083,10 +1132,12 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
       return fail<LinkGraph>("section size overflows");
     if (VirtualSize != InputSection.getSize())
       Bytes.resize(static_cast<size_t>(VirtualSize));
+    const auto Kind = MachOFunctionSections.count(InputSection.getIndex()) != 0
+                          ? SectionKind::Text
+                          : sectionKind(InputSection, Purpose);
     auto Added = Graph.addSection(
-        Section{Name.str(), sectionKind(InputSection, Purpose),
-                sectionAlignment(InputSection), VirtualSize, 0, 0,
-                std::move(Bytes), Purpose, InputSection.getAddress()});
+        Section{Name.str(), Kind, sectionAlignment(InputSection), VirtualSize,
+                0, 0, std::move(Bytes), Purpose, InputSection.getAddress()});
     if (!Added) {
       return fail<LinkGraph>(Added.error().Message);
     }
@@ -1319,6 +1370,11 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
           (*ActualTarget == Target::X86_64 && Mode == CompactUnwindX8664Dwarf);
       if (!IsDwarf)
         return fail<SymbolId>("compact unwind encoding is not DWARF");
+      if (Function >= Graph.symbols().size())
+        return fail<SymbolId>("invalid DWARF compact unwind function");
+      const auto &FunctionSymbol = Graph.symbols()[Function];
+      const uint32_t EncodedOffset = Encoding & CompactUnwindDwarfOffsetMask;
+      bool CanonicalCandidate = false;
       std::optional<std::pair<SectionId, uint64_t>> Match;
       for (const auto &EHSection : Object.sections()) {
         const auto GraphSection = SectionIds.find(EHSection.getIndex());
@@ -1333,13 +1389,85 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
         const Span<const Byte> EHBytes(
             reinterpret_cast<const Byte *>(EHContents.data()),
             EHContents.size());
+        std::optional<std::pair<uint64_t, SymbolId>> Subtractor;
         for (const auto &Relocation : EHSection.relocations()) {
+          if (*ActualTarget == Target::AArch64 &&
+              Relocation.getType() == llvm::MachO::ARM64_RELOC_SUBTRACTOR) {
+            const auto InputSymbol = Relocation.getSymbol();
+            if (InputSymbol == Object.symbol_end()) {
+              Subtractor.reset();
+              continue;
+            }
+            const auto Symbol =
+                SymbolIds.find(InputSymbol->getRawDataRefImpl());
+            if (Symbol == SymbolIds.end()) {
+              Subtractor.reset();
+              continue;
+            }
+            Subtractor = std::pair{Relocation.getOffset(), Symbol->second};
+            continue;
+          }
           const auto InputSymbol = Relocation.getSymbol();
-          if (InputSymbol == Object.symbol_end())
+          SectionId TargetSection = InvalidSectionId;
+          uint64_t TargetOffset = 0;
+          if (*ActualTarget == Target::AArch64 &&
+              Relocation.getType() == llvm::MachO::ARM64_RELOC_UNSIGNED &&
+              Subtractor && Subtractor->first == Relocation.getOffset()) {
+            auto InputTargetSection = Object.section_end();
+            if (InputSymbol == Object.symbol_end()) {
+              const auto *MachO =
+                  llvm::cast<llvm::object::MachOObjectFile>(&Object);
+              InputTargetSection =
+                  MachO->getRelocationSection(Relocation.getRawDataRefImpl());
+            } else {
+              auto SymbolSection = InputSymbol->getSection();
+              if (!SymbolSection) {
+                llvm::consumeError(SymbolSection.takeError());
+                return fail<SymbolId>("cannot read DWARF FDE target section");
+              }
+              InputTargetSection = *SymbolSection;
+              const auto Symbol =
+                  SymbolIds.find(InputSymbol->getRawDataRefImpl());
+              if (Symbol == SymbolIds.end())
+                continue;
+              TargetOffset = Graph.symbols()[Symbol->second].Offset;
+            }
+            if (InputTargetSection == Object.section_end())
+              continue;
+            const auto GraphTargetSection =
+                SectionIds.find(InputTargetSection->getIndex());
+            if (GraphTargetSection == SectionIds.end())
+              continue;
+            TargetSection = GraphTargetSection->second;
+            const auto &SubtractorSymbol = Graph.symbols()[Subtractor->second];
+            const uint64_t Field = Relocation.getOffset();
+            if (SubtractorSymbol.Offset > Field)
+              return fail<SymbolId>("invalid DWARF FDE subtractor offset");
+            uint64_t Raw = 0;
+            if (!readELFInteger(EHBytes, Field, true, Raw))
+              return fail<SymbolId>("cannot read DWARF FDE addend");
+            auto Resolved = Internal::resolveMachOFDEAddress(
+                TargetOffset, 0, Field - SubtractorSymbol.Offset,
+                static_cast<int64_t>(Raw));
+            if (!Resolved)
+              return fail<SymbolId>("DWARF FDE target address overflows");
+            TargetOffset = *Resolved;
+            Subtractor.reset();
+          } else {
+            if (InputSymbol == Object.symbol_end())
+              continue;
+            const auto Symbol =
+                SymbolIds.find(InputSymbol->getRawDataRefImpl());
+            if (Symbol == SymbolIds.end())
+              continue;
+            const auto &Target = Graph.symbols()[Symbol->second];
+            TargetSection = Target.Section;
+            TargetOffset = Target.Offset;
+          }
+          if (TargetSection != FunctionSymbol.Section ||
+              TargetOffset != FunctionSymbol.Offset)
             continue;
-          const auto Symbol = SymbolIds.find(InputSymbol->getRawDataRefImpl());
-          if (Symbol == SymbolIds.end() || Symbol->second != Function)
-            continue;
+          CanonicalCandidate = true;
           const uint64_t Field = Relocation.getOffset();
           if (Field < 8)
             return fail<SymbolId>("invalid DWARF compact unwind FDE field");
@@ -1362,15 +1490,15 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
           }
           if (!Boundary)
             return fail<SymbolId>("DWARF compact unwind offset is not an FDE");
-          const uint32_t EncodedOffset =
-              Encoding & CompactUnwindDwarfOffsetMask;
           if (EncodedOffset != 0 && EncodedOffset != Record)
-            return fail<SymbolId>("DWARF compact unwind FDE offset mismatch");
+            continue;
           if (Match && *Match != std::pair{GraphSection->second, Record})
             return fail<SymbolId>("ambiguous DWARF compact unwind FDE");
           Match = std::pair{GraphSection->second, Record};
         }
       }
+      if (!Match && EncodedOffset != 0 && CanonicalCandidate)
+        return fail<SymbolId>("DWARF compact unwind FDE offset mismatch");
       if (!Match)
         return fail<SymbolId>("missing DWARF compact unwind FDE");
       const auto Existing =
@@ -1517,42 +1645,73 @@ Expect<LinkGraph> ObjectReader::read(Span<const Byte> Buffer,
           const auto UnsignedMetadata =
               relocationMetadata(Object, *InputRelocation, *ActualTarget);
           if (!UnsignedMetadata || UnsignedMetadata->PatchSize != 8 ||
-              UnsignedMetadata->PCRelative || !UnsignedMetadata->External ||
-              UnsignedMetadata->Scattered)
+              UnsignedMetadata->PCRelative || UnsignedMetadata->Scattered)
             return fail<LinkGraph>(
                 "unsupported AArch64 Mach-O EH frame unsigned relocation");
           if (InputRelocation->getOffset() != Offset)
             return fail<LinkGraph>(
                 "AArch64 Mach-O EH frame relocation pair addresses differ");
           const auto UnsignedInputSymbol = InputRelocation->getSymbol();
-          if (UnsignedInputSymbol == Object.symbol_end())
-            return fail<LinkGraph>("AArch64 Mach-O EH frame unsigned "
-                                   "relocation has no target symbol");
-          const auto Unsigned =
-              SymbolIds.find(UnsignedInputSymbol->getRawDataRefImpl());
-          if (Unsigned == SymbolIds.end())
-            return fail<LinkGraph>(
-                "AArch64 Mach-O EH frame relocation targets an unsupported "
-                "symbol");
           const auto &SubtractorSymbol = Graph.symbols()[Subtractor->second];
-          const auto &UnsignedSymbol = Graph.symbols()[Unsigned->second];
+          if (SubtractorSymbol.Offset > Offset)
+            return fail<LinkGraph>(
+                "invalid AArch64 Mach-O EH frame subtractor symbol offset");
+          uint64_t Raw = 0;
+          if (!readELFInteger(Graph.sections()[Section->second].Content, Offset,
+                              true, Raw))
+            return fail<LinkGraph>(
+                "unsupported AArch64 Mach-O EH frame relocation addend");
+          const uint64_t Delta = Offset - SubtractorSymbol.Offset;
+          SymbolId Unsigned = InvalidSymbolId;
+          if (UnsignedMetadata->External) {
+            if (UnsignedInputSymbol == Object.symbol_end())
+              return fail<LinkGraph>("AArch64 Mach-O EH frame unsigned "
+                                     "relocation has no target symbol");
+            const auto Symbol =
+                SymbolIds.find(UnsignedInputSymbol->getRawDataRefImpl());
+            if (Symbol == SymbolIds.end() || Raw != UINT64_C(0) - Delta)
+              return fail<LinkGraph>(
+                  "unsupported AArch64 Mach-O EH frame relocation addend");
+            Unsigned = Symbol->second;
+          } else {
+            const auto *MachO =
+                llvm::cast<llvm::object::MachOObjectFile>(&Object);
+            const auto TargetSection = MachO->getRelocationSection(
+                InputRelocation->getRawDataRefImpl());
+            const auto GraphTargetSection =
+                TargetSection == Object.section_end()
+                    ? SectionIds.end()
+                    : SectionIds.find(TargetSection->getIndex());
+            if (GraphTargetSection == SectionIds.end())
+              return fail<LinkGraph>(
+                  "AArch64 Mach-O EH frame relocation targets an unsupported "
+                  "section");
+            auto TargetOffset = Internal::resolveMachOFDEAddress(
+                0, 0, Delta, static_cast<int64_t>(Raw));
+            if (!TargetOffset)
+              return fail<LinkGraph>("DWARF FDE target address overflows");
+            const auto Symbol = std::find_if(
+                Graph.symbols().begin(), Graph.symbols().end(),
+                [&](const auto &Value) {
+                  return Value.Section == GraphTargetSection->second &&
+                         Value.Offset == *TargetOffset &&
+                         Value.Name.rfind("$section", 0) != 0;
+                });
+            if (Symbol == Graph.symbols().end())
+              return fail<LinkGraph>(
+                  "AArch64 Mach-O EH frame relocation targets an unsupported "
+                  "symbol");
+            Unsigned = static_cast<SymbolId>(Symbol - Graph.symbols().begin());
+          }
+          const auto &UnsignedSymbol = Graph.symbols()[Unsigned];
           if (UnsignedSymbol.Section >= Graph.sections().size() ||
               Graph.sections()[UnsignedSymbol.Section].Kind !=
                   SectionKind::Text)
             return fail<LinkGraph>(
                 "AArch64 Mach-O EH frame relocation target is not a function "
                 "symbol");
-          if (SubtractorSymbol.Offset > Offset)
-            return fail<LinkGraph>(
-                "invalid AArch64 Mach-O EH frame subtractor symbol offset");
-          uint64_t Raw = 0;
-          if (!readELFInteger(Graph.sections()[Section->second].Content, Offset,
-                              true, Raw) ||
-              Raw != UINT64_C(0) - (Offset - SubtractorSymbol.Offset))
-            return fail<LinkGraph>(
-                "unsupported AArch64 Mach-O EH frame relocation addend");
           if (!Graph.addEHFrameReference(
-                  EHFrameReference{Section->second, Offset, Unsigned->second}))
+                  EHFrameReference{Section->second, Offset, Unsigned}))
             return fail<LinkGraph>("invalid Mach-O EH frame relocation");
           ++InputRelocation;
           continue;

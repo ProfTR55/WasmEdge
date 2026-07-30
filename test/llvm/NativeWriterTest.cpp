@@ -31,6 +31,7 @@
 #include <llvm/Support/MemoryBufferRef.h>
 
 #include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -49,6 +50,24 @@
 namespace {
 
 using namespace WasmEdge::LLVM::Linker;
+
+#if WASMEDGE_OS_WINDOWS
+class ScopedInvalidParameterHandler {
+public:
+  ScopedInvalidParameterHandler()
+      : Previous(_set_thread_local_invalid_parameter_handler(ignore)) {}
+
+  ~ScopedInvalidParameterHandler() {
+    _set_thread_local_invalid_parameter_handler(Previous);
+  }
+
+private:
+  static void ignore(const wchar_t *, const wchar_t *, const wchar_t *,
+                     unsigned int, uintptr_t) {}
+
+  _invalid_parameter_handler Previous;
+};
+#endif
 
 #define REQUIRE_LINUX_RELOCATIONS()                                            \
   do {                                                                         \
@@ -2527,7 +2546,14 @@ TEST(NativeWriterTest, OwnsDescriptorUntilClose) {
   }
 
 #if WASMEDGE_OS_WINDOWS
-  EXPECT_EQ(::_close(File), -1);
+  const ScopedInvalidParameterHandler InvalidParameterHandler;
+  errno = 0;
+  const int Duplicate = ::_dup(File);
+  const int Error = errno;
+  if (Duplicate != -1)
+    EXPECT_EQ(::_close(Duplicate), 0);
+  EXPECT_EQ(Duplicate, -1);
+  EXPECT_EQ(Error, EBADF);
 #else
   EXPECT_EQ(::close(File), -1);
 #endif

@@ -275,7 +275,7 @@ std::vector<WasmEdge::Byte> makeObject(
     std::string ModuleAssembly = {}, bool SemanticSymbols = false,
     bool TypeWrapper = false, bool FloatingPoint = false,
     bool DefineFltused = false, bool UnusedAllocatableSections = false,
-    bool DistinctTypeWrapperUnwind = false) {
+    bool DistinctTypeWrapperUnwind = false, bool UnusedFunctionUnwind = false) {
   std::string Error;
   const llvm::Target *NativeTarget = lookupLLVMTarget(Triple, Error);
   EXPECT_NE(NativeTarget, nullptr) << Error;
@@ -385,7 +385,15 @@ std::vector<WasmEdge::Byte> makeObject(
                                : Triple.isOSBinFormatCOFF() ? ".text$unused"
                                                             : ".text.unused");
     UnusedFunction->addFnAttr(llvm::Attribute::NoInline);
-    UnusedFunction->addFnAttr(llvm::Attribute::NoUnwind);
+    if (UnusedFunctionUnwind) {
+#if LLVM_VERSION_MAJOR >= 14
+      UnusedFunction->setUWTableKind(llvm::UWTableKind::Sync);
+#else
+      UnusedFunction->addFnAttr(llvm::Attribute::UWTable);
+#endif
+    } else {
+      UnusedFunction->addFnAttr(llvm::Attribute::NoUnwind);
+    }
     llvm::IRBuilder<> UnusedBuilder(
         llvm::BasicBlock::Create(Context, "entry", UnusedFunction));
     UnusedBuilder.CreateRet(llvm::ConstantInt::get(I32, UINT32_C(0x5A17)));
@@ -768,6 +776,73 @@ void clearMachOSectionRelocations(std::vector<WasmEdge::Byte> &Bytes,
   }
 }
 
+void clearMachOSectionInstructionAttributes(std::vector<WasmEdge::Byte> &Bytes,
+                                            std::string_view Name) {
+  constexpr size_t MachHeaderSize = 32;
+  constexpr size_t SegmentCommandSize = 72;
+  constexpr size_t SectionSize = 80;
+  constexpr size_t SectionFlagsOffset = 64;
+  const uint32_t CommandCount = read32le(Bytes, 16);
+  size_t CommandOffset = MachHeaderSize;
+  bool Cleared = false;
+  for (uint32_t I = 0; I < CommandCount; ++I) {
+    const uint32_t Command = read32le(Bytes, CommandOffset);
+    const uint32_t CommandSize = read32le(Bytes, CommandOffset + 4);
+    if (Command == llvm::MachO::LC_SEGMENT_64) {
+      const uint32_t SectionCount = read32le(Bytes, CommandOffset + 64);
+      for (uint32_t J = 0; J < SectionCount; ++J) {
+        const size_t SectionOffset =
+            CommandOffset + SegmentCommandSize + J * SectionSize;
+        const std::string_view SectionName(
+            reinterpret_cast<const char *>(Bytes.data() + SectionOffset), 16);
+        if (SectionName.substr(0, SectionName.find('\0')) != Name)
+          continue;
+        const uint32_t Flags =
+            read32le(Bytes, SectionOffset + SectionFlagsOffset);
+        write32le(Bytes, SectionOffset + SectionFlagsOffset,
+                  Flags & ~(llvm::MachO::S_ATTR_PURE_INSTRUCTIONS |
+                            llvm::MachO::S_ATTR_SOME_INSTRUCTIONS));
+        Cleared = true;
+      }
+    }
+    CommandOffset += CommandSize;
+  }
+  ASSERT_TRUE(Cleared);
+}
+
+void renameMachOSection(std::vector<WasmEdge::Byte> &Bytes,
+                        std::string_view OldName, std::string_view NewName) {
+  constexpr size_t MachHeaderSize = 32;
+  constexpr size_t SegmentCommandSize = 72;
+  constexpr size_t SectionSize = 80;
+  ASSERT_LE(NewName.size(), 16U);
+  const uint32_t CommandCount = read32le(Bytes, 16);
+  size_t CommandOffset = MachHeaderSize;
+  bool Renamed = false;
+  for (uint32_t I = 0; I < CommandCount; ++I) {
+    const uint32_t Command = read32le(Bytes, CommandOffset);
+    const uint32_t CommandSize = read32le(Bytes, CommandOffset + 4);
+    if (Command == llvm::MachO::LC_SEGMENT_64) {
+      const uint32_t SectionCount = read32le(Bytes, CommandOffset + 64);
+      for (uint32_t J = 0; J < SectionCount; ++J) {
+        const size_t SectionOffset =
+            CommandOffset + SegmentCommandSize + J * SectionSize;
+        const std::string_view SectionName(
+            reinterpret_cast<const char *>(Bytes.data() + SectionOffset), 16);
+        if (SectionName.substr(0, SectionName.find('\0')) != OldName)
+          continue;
+        std::fill_n(Bytes.begin() + static_cast<ptrdiff_t>(SectionOffset), 16,
+                    WasmEdge::Byte{0});
+        std::copy(NewName.begin(), NewName.end(),
+                  Bytes.begin() + static_cast<ptrdiff_t>(SectionOffset));
+        Renamed = true;
+      }
+    }
+    CommandOffset += CommandSize;
+  }
+  ASSERT_TRUE(Renamed);
+}
+
 struct CompactUnwindObjectOffsets {
   size_t Content;
   uint32_t Count;
@@ -929,7 +1004,7 @@ std::vector<WasmEdge::Byte> makeNativeObject(bool Undefined = false) {
 
 std::vector<WasmEdge::Byte> makeUnusedNativeObject() {
   return makeObject(llvm::Triple(llvm::sys::getDefaultTargetTriple()), false,
-                    false, "f0", {}, false, false, "generic", {}, false, false,
+                    false, "f0", {}, false, true, "generic", {}, false, false,
                     false, false, false, false, {}, true, false, false, false,
                     true);
 }
@@ -986,6 +1061,228 @@ std::vector<WasmEdge::Byte> makeAssemblyObject(const llvm::Triple &Triple,
   EXPECT_FALSE(Machine->addPassesToEmitFile(Passes, Stream, nullptr, FileType));
   Passes.run(Module);
   return std::vector<WasmEdge::Byte>(Storage.begin(), Storage.end());
+}
+
+std::vector<WasmEdge::Byte> makeAliasedAArch64MachODwarfObject(
+    std::string_view FunctionSection = "__text") {
+  const std::string Assembly = ".section __TEXT," +
+                               std::string(FunctionSection) +
+                               R"(,regular,pure_instructions
+.globl _compact_alias
+.globl _fde_alias
+_compact_alias:
+_fde_alias:
+ret
+.section __TEXT,__eh_frame,coalesced,no_toc+strip_static_syms+live_support
+.p2align 3
+Laliased_cie:
+.long Laliased_cie_end-Laliased_cie-4
+.long 0
+.byte 1
+.asciz "zR"
+.byte 4
+.byte 0x78
+.byte 30
+.byte 1
+.byte 0x10
+.p2align 3
+Laliased_cie_end:
+Laliased_fde:
+.long Laliased_fde_end-Laliased_fde-4
+.long Laliased_fde+4-Laliased_cie
+.quad _fde_alias-.
+.quad 4
+.byte 0
+.p2align 3
+Laliased_fde_end:
+.long 0
+.section __LD,__compact_unwind,regular,debug
+.p2align 3
+.quad _compact_alias
+.long 4
+.long 0x03000018
+.quad 0
+.quad 0
+)";
+  return makeAssemblyObject(llvm::Triple("arm64-apple-macosx"), Assembly);
+}
+
+std::vector<WasmEdge::Byte> makeRegularMachOFunctionSectionObject() {
+  auto Bytes =
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, false, false, false, false, false,
+                 false, {}, false, false, false, false, true, false, true);
+  renameMachOSection(Bytes, "__unused_text", "__custom_text");
+  clearMachOSectionInstructionAttributes(Bytes, "__custom_text");
+  return Bytes;
+}
+
+std::vector<WasmEdge::Byte> makeSectionTargetAArch64MachODwarfObject() {
+  constexpr std::string_view Assembly = R"(
+.text
+nop
+.globl _section_target
+_section_target:
+Lsection_target:
+ret
+.section __TEXT,__eh_frame,coalesced,no_toc+strip_static_syms+live_support
+.p2align 3
+Lsection_cie:
+.long Lsection_cie_end-Lsection_cie-4
+.long 0
+.byte 1
+.asciz "zR"
+.byte 4
+.byte 0x78
+.byte 30
+.byte 1
+.byte 0x10
+.p2align 3
+Lsection_cie_end:
+Lsection_fde:
+.long Lsection_fde_end-Lsection_fde-4
+.long Lsection_fde+4-Lsection_cie
+.quad Lsection_target-.
+.quad 4
+.byte 0
+.p2align 3
+Lsection_fde_end:
+.long 0
+.section __LD,__compact_unwind,regular,debug
+.p2align 3
+.quad _section_target
+.long 4
+.long 0x03000018
+.quad 0
+.quad 0
+)";
+  auto Bytes = makeAssemblyObject(llvm::Triple("arm64-apple-macosx"),
+                                  std::string(Assembly));
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "section-target.o"));
+  EXPECT_TRUE(static_cast<bool>(Object));
+  if (!Object) {
+    llvm::consumeError(Object.takeError());
+    return Bytes;
+  }
+  const auto *MachO = llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Object);
+  EXPECT_NE(MachO, nullptr);
+  if (MachO == nullptr)
+    return Bytes;
+  uint32_t TextOrdinal = 0;
+  uint32_t Ordinal = 0;
+  for (const auto &Section : MachO->sections()) {
+    ++Ordinal;
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (Name && *Name == "__text")
+      TextOrdinal = Ordinal;
+  }
+  EXPECT_NE(TextOrdinal, 0U);
+  for (const auto &Section : MachO->sections()) {
+    auto Name = Section.getName();
+    EXPECT_TRUE(static_cast<bool>(Name));
+    if (!Name || *Name != "__eh_frame")
+      continue;
+    auto Contents = Section.getContents();
+    EXPECT_TRUE(static_cast<bool>(Contents));
+    const auto Header = MachO->getSection64(Section.getRawDataRefImpl());
+    for (const auto &Relocation : Section.relocations()) {
+      if (Relocation.getType() != llvm::MachO::ARM64_RELOC_UNSIGNED)
+        continue;
+      const size_t FileOffset =
+          Header.reloff + Relocation.getRawDataRefImpl().d.b * 8 + 4;
+      const uint32_t Word = read32le(Bytes, FileOffset);
+      write32le(Bytes, FileOffset, (Word & UINT32_C(0xF7000000)) | TextOrdinal);
+      const size_t Content = static_cast<size_t>(
+          reinterpret_cast<const WasmEdge::Byte *>(Contents->data()) -
+          Bytes.data());
+      write64le(Bytes, Content + Relocation.getOffset(),
+                read64le(Bytes, Content + Relocation.getOffset()) + 4);
+    }
+  }
+  return Bytes;
+}
+
+void setMachOEHFrameInitialLocation(std::vector<WasmEdge::Byte> &Bytes,
+                                    uint64_t Value) {
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "malformed-section-target.o"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  for (const auto &Section : (*Object)->sections()) {
+    auto Name = Section.getName();
+    ASSERT_TRUE(static_cast<bool>(Name));
+    if (*Name != "__eh_frame")
+      continue;
+    auto Contents = Section.getContents();
+    ASSERT_TRUE(static_cast<bool>(Contents));
+    const size_t Content = static_cast<size_t>(
+        reinterpret_cast<const WasmEdge::Byte *>(Contents->data()) -
+        Bytes.data());
+    for (const auto &Relocation : Section.relocations()) {
+      if (Relocation.getType() == llvm::MachO::ARM64_RELOC_UNSIGNED)
+        write64le(Bytes, Content + Relocation.getOffset(), Value);
+    }
+    return;
+  }
+  FAIL() << "generated object has no EH frame section";
+}
+
+std::vector<WasmEdge::Byte>
+makeMultipleFDEAArch64MachODwarfObject(uint32_t Encoding) {
+  std::string Assembly = R"(
+.text
+.globl _multiple_fde
+_multiple_fde:
+ret
+.section __TEXT,__eh_frame,coalesced,no_toc+strip_static_syms+live_support
+.p2align 3
+Lmultiple_cie:
+.long Lmultiple_cie_end-Lmultiple_cie-4
+.long 0
+.byte 1
+.asciz "zR"
+.byte 4
+.byte 0x78
+.byte 30
+.byte 1
+.byte 0x10
+.p2align 3
+Lmultiple_cie_end:
+Lmultiple_fde0:
+.long Lmultiple_fde0_end-Lmultiple_fde0-4
+.long Lmultiple_fde0+4-Lmultiple_cie
+.quad _multiple_fde-.
+.quad 4
+.byte 0
+.p2align 3
+Lmultiple_fde0_end:
+Lmultiple_fde1:
+.long Lmultiple_fde1_end-Lmultiple_fde1-4
+.long Lmultiple_fde1+4-Lmultiple_cie
+.quad _multiple_fde-.
+.quad 4
+.byte 0
+.p2align 3
+Lmultiple_fde1_end:
+.long 0
+.section __LD,__compact_unwind,regular,debug
+.p2align 3
+.quad _multiple_fde
+.long 4
+.long )";
+  Assembly += std::to_string(Encoding);
+  Assembly += R"(
+.quad 0
+.quad 0
+)";
+  return makeAssemblyObject(llvm::Triple("arm64-apple-macosx"), Assembly);
 }
 
 std::vector<WasmEdge::Byte> makeX86_64AssemblyObject(std::string Assembly) {
@@ -1702,8 +1999,12 @@ TEST_F(LinkerOutputTest, RetainsUnusedAllocatableSections) {
   ASSERT_EQ(UnusedDataSize, UnusedData.size());
   ASSERT_LE(UnusedDataOffset, UnusedDataContent.size());
   ASSERT_LE(UnusedDataSize, UnusedDataContent.size() - UnusedDataOffset);
+  using Difference = std::vector<WasmEdge::Byte>::difference_type;
+  ASSERT_LE(UnusedDataOffset,
+            static_cast<uint64_t>(std::numeric_limits<Difference>::max()));
   EXPECT_TRUE(std::equal(UnusedData.begin(), UnusedData.end(),
-                         UnusedDataContent.begin() + UnusedDataOffset));
+                         UnusedDataContent.begin() +
+                             static_cast<Difference>(UnusedDataOffset)));
 
   const auto Universal = Directory / "retained.wasm";
   ASSERT_TRUE(NativeLinker::link(Object, TinyWasm, Universal,
@@ -3787,7 +4088,7 @@ TEST(AArch64RelocationTest, EncodesPageAndScaledLow12Relocations) {
     uint32_t Expected;
     bool Accepted;
   };
-  const std::array<Case, 7> Cases{{
+  const std::array<Case, 10> Cases{{
       {0x115, 0x91000000, 0x1ABC, 0x912AF000, true},
       {0x116, 0x39000000, 0x1ABC, 0x392AF000, true},
       {0x11C, 0x79000000, 0x1ABC, 0x79157800, true},
@@ -3795,6 +4096,9 @@ TEST(AArch64RelocationTest, EncodesPageAndScaledLow12Relocations) {
       {0x11E, 0xF9000000, 0x1AB8, 0xF9055C00, true},
       {0x12B, 0x3D800000, 0x1AB0, 0x3D82AC00, true},
       {0x11E, 0xF9000000, 0x1ABC, 0, false},
+      {0x11E, 0xD503201F, 0x1AB8, 0, false},
+      {0x11E, 0xBD400000, 0x1AB8, 0, false},
+      {0x11E, 0x3DC00000, 0x1AB8, 0, false},
   }};
   for (const auto &Test : Cases) {
     std::vector<WasmEdge::Byte> Bytes(16);
@@ -3889,6 +4193,21 @@ TEST(AArch64RelocationTest, RejectsShiftedAddLow12InstructionAtomically) {
   const auto Snapshot = Graph;
   EXPECT_FALSE(applyRelocations(Graph));
   expectGraphStateEquals(Graph, Snapshot);
+}
+
+TEST(AArch64RelocationTest, AppliesLoadStore64Low12ToDRegisterInstruction) {
+  std::vector<WasmEdge::Byte> Bytes(8);
+  ASSERT_TRUE(Internal::writeUnsigned(Bytes, 0, 4, Endianness::Little,
+                                      UINT32_C(0xFD400000)));
+  auto Graph =
+      makeELFRelocationGraph(Target::AArch64, Endianness::Little,
+                             llvm::ELF::R_AARCH64_LDST64_ABS_LO12_NC, 4, 0x1AB8,
+                             0x1000, 0, 0, false, std::move(Bytes));
+
+  ASSERT_TRUE(applyRelocations(Graph));
+  EXPECT_EQ(*Internal::readUnsigned(Graph.sections()[0].Content, 0, 4,
+                                    Endianness::Little),
+            UINT32_C(0xFD455C00));
 }
 
 TEST(AArch64RelocationTest, ChecksAdrpPageDeltaBoundaries) {
@@ -6315,6 +6634,154 @@ TEST(ObjectReaderTest, AssociatesExactNonzeroDwarfOffset) {
   EXPECT_TRUE(compactUnwindToEHFrame(*Graph));
 }
 
+TEST(ObjectReaderTest, AssociatesDwarfFDEThroughEquivalentMachOSymbols) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
+  const auto Bytes = makeAliasedAArch64MachODwarfObject();
+  const auto Inventory = collectCompactUnwindInventory(Bytes);
+  ASSERT_TRUE(Inventory.HasCompactUnwind);
+  ASSERT_TRUE(Inventory.HasEHFrame);
+  ASSERT_EQ(Inventory.Records.size(), 1U);
+  EXPECT_EQ(Inventory.Records[0].Encoding, UINT32_C(0x03000018));
+
+  auto Graph =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  ASSERT_EQ(Graph->compactUnwind().size(), 1U);
+  const auto &Record = Graph->compactUnwind()[0];
+  ASSERT_TRUE(Record.FDE);
+  EXPECT_EQ(Graph->symbols()[*Record.FDE].Offset, 24U);
+  EXPECT_TRUE(compactUnwindToEHFrame(*Graph));
+}
+
+TEST(ObjectReaderTest, AssociatesSectionTargetDwarfFDEAtFunctionOffset) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
+  const auto Bytes = makeSectionTargetAArch64MachODwarfObject();
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "section-target.o"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  bool SectionTarget = false;
+  for (const auto &Section : (*Object)->sections()) {
+    auto Name = Section.getName();
+    ASSERT_TRUE(static_cast<bool>(Name));
+    if (*Name != "__eh_frame")
+      continue;
+    for (const auto &Relocation : Section.relocations()) {
+      if (Relocation.getOffset() != 32 ||
+          Relocation.getType() != llvm::MachO::ARM64_RELOC_UNSIGNED)
+        continue;
+      const auto Symbol = Relocation.getSymbol();
+      SectionTarget = Symbol == (*Object)->symbol_end();
+    }
+  }
+  ASSERT_TRUE(SectionTarget);
+
+  auto Graph =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  ASSERT_EQ(Graph->compactUnwind().size(), 1U);
+  ASSERT_TRUE(Graph->compactUnwind()[0].FDE);
+  const auto &Function = Graph->symbols()[Graph->compactUnwind()[0].Function];
+  EXPECT_EQ(Function.Offset, 4U);
+  EXPECT_EQ(Graph->symbols()[*Graph->compactUnwind()[0].FDE].Offset, 24U);
+  EXPECT_TRUE(compactUnwindToEHFrame(*Graph));
+}
+
+TEST(ObjectReaderTest, RejectsOverflowingSectionTargetDwarfFDEAddend) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
+  auto Bytes = makeSectionTargetAArch64MachODwarfObject();
+  setMachOEHFrameInitialLocation(Bytes, UINT64_C(0x8000000000000000));
+  std::string Diagnostic;
+  WasmEdge::Log::setLoggingCallback([&](const spdlog::details::log_msg &Value) {
+    Diagnostic.assign(Value.payload.data(), Value.payload.size());
+  });
+  WasmEdge::Log::setErrorLoggingLevel();
+  auto Result =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
+  WasmEdge::Log::setLoggingCallback(nullptr);
+  ASSERT_FALSE(Result);
+  EXPECT_NE(Diagnostic.find("DWARF FDE target address overflows"),
+            std::string::npos)
+      << Diagnostic;
+}
+
+TEST(ObjectReaderTest, SelectsEncodedDwarfFDEFromMultipleCandidates) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
+  auto Bytes = makeMultipleFDEAArch64MachODwarfObject(UINT32_C(0x03000000));
+  const auto FDEs = ehFrameFDEOffsets(Bytes);
+  ASSERT_EQ(FDEs.size(), 2U);
+  const auto Offsets = compactUnwindObjectOffsets(Bytes);
+  ASSERT_NE(Offsets.Content, 0U);
+  write32le(Bytes, Offsets.Content + 12, UINT32_C(0x03000000) | FDEs.back());
+
+  auto Graph =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  ASSERT_TRUE(Graph->compactUnwind()[0].FDE);
+  EXPECT_EQ(Graph->symbols()[*Graph->compactUnwind()[0].FDE].Offset,
+            FDEs.back());
+}
+
+TEST(ObjectReaderTest, RejectsAmbiguousZeroOffsetDwarfFDE) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
+  const auto Bytes =
+      makeMultipleFDEAArch64MachODwarfObject(UINT32_C(0x03000000));
+  ASSERT_EQ(ehFrameFDEOffsets(Bytes).size(), 2U);
+  EXPECT_FALSE(ObjectReader::read(Bytes, Target::AArch64,
+                                  ObjectReaderPolicy::Universal));
+}
+
+TEST(ObjectReaderTest, ClassifiesMachOCustomFunctionSectionAsText) {
+  REQUIRE_LLVM_TARGET("arm64-apple-macosx");
+  const auto Bytes = makeRegularMachOFunctionSectionObject();
+  auto Object =
+      llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
+          llvm::StringRef(reinterpret_cast<const char *>(Bytes.data()),
+                          Bytes.size()),
+          "custom-section.o"));
+  ASSERT_TRUE(static_cast<bool>(Object));
+  bool PriorReadOnly = false;
+  for (const auto &Section : (*Object)->sections()) {
+    auto Name = Section.getName();
+    ASSERT_TRUE(static_cast<bool>(Name));
+    if (*Name != "__custom_text")
+      continue;
+    const auto *MachO =
+        llvm::dyn_cast<llvm::object::MachOObjectFile>(&**Object);
+    ASSERT_NE(MachO, nullptr);
+    const uint32_t Flags =
+        MachO->getSection64(Section.getRawDataRefImpl()).flags;
+    PriorReadOnly = !Section.isText() &&
+                    (Flags & (llvm::MachO::S_ATTR_PURE_INSTRUCTIONS |
+                              llvm::MachO::S_ATTR_SOME_INSTRUCTIONS)) == 0;
+  }
+  ASSERT_TRUE(PriorReadOnly);
+  auto Graph =
+      ObjectReader::read(Bytes, Target::AArch64, ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(Graph);
+  const auto Function = std::find_if(
+      Graph->symbols().begin(), Graph->symbols().end(),
+      [](const auto &Symbol) { return Symbol.Name == "_unused_function"; });
+  ASSERT_NE(Function, Graph->symbols().end());
+  ASSERT_LT(Function->Section, Graph->sections().size());
+  EXPECT_EQ(Graph->sections()[Function->Section].Name, "__custom_text");
+  EXPECT_EQ(Graph->sections()[Function->Section].Kind, SectionKind::Text);
+  const auto DataObject =
+      makeObject(llvm::Triple("arm64-apple-macosx"), false, false, "f0", {},
+                 false, false, "generic", {}, false, false, false, false, false,
+                 false, {}, false, false, false, false, true);
+  auto DataGraph = ObjectReader::read(DataObject, Target::AArch64,
+                                      ObjectReaderPolicy::Universal);
+  ASSERT_TRUE(DataGraph);
+  const auto Data = std::find_if(
+      DataGraph->symbols().begin(), DataGraph->symbols().end(),
+      [](const auto &Symbol) { return Symbol.Name == "_unused_data"; });
+  ASSERT_NE(Data, DataGraph->symbols().end());
+  EXPECT_NE(DataGraph->sections()[Data->Section].Kind, SectionKind::Text);
+}
+
 TEST(CompactUnwindTest, ConvertsSparseX86RBPRegisterSlots) {
   auto Graph = makeCompactUnwindGraph(Target::X86_64, 0x01040081);
   ASSERT_TRUE(compactUnwindToEHFrame(Graph));
@@ -6886,7 +7353,13 @@ TEST(ObjectReaderTest, RejectsConcatenatedCOFFBigObj) {
   const size_t BigSymbolTable = SymbolTable + HeaderGrowth;
   std::vector<WasmEdge::Byte> BigObj(Normal.size() + HeaderGrowth +
                                      SymbolCount * SymbolGrowth);
-  std::copy(Normal.begin() + 20, Normal.begin() + SymbolTable,
+  using Difference = decltype(Normal)::difference_type;
+  ASSERT_LE(Normal.size(),
+            static_cast<size_t>(std::numeric_limits<Difference>::max()));
+  ASSERT_LE(BigObj.size(),
+            static_cast<size_t>(std::numeric_limits<Difference>::max()));
+  std::copy(Normal.begin() + 20,
+            Normal.begin() + static_cast<Difference>(SymbolTable),
             BigObj.begin() + 56);
   BigObj[2] = 0xFF;
   BigObj[3] = 0xFF;
@@ -6909,23 +7382,27 @@ TEST(ObjectReaderTest, RejectsConcatenatedCOFFBigObj) {
   for (uint32_t I = 0; I < SymbolCount;) {
     const size_t Input = SymbolTable + static_cast<size_t>(I) * 18;
     const size_t Output = BigSymbolTable + static_cast<size_t>(I) * 20;
-    std::copy_n(Normal.begin() + Input, 12, BigObj.begin() + Output);
+    std::copy_n(Normal.begin() + static_cast<Difference>(Input), 12,
+                BigObj.begin() + static_cast<Difference>(Output));
     const int16_t Section =
         static_cast<int16_t>(static_cast<uint16_t>(Normal[Input + 12]) |
                              static_cast<uint16_t>(Normal[Input + 13]) << 8);
     write32le(BigObj, Output + 12, static_cast<uint32_t>(Section));
-    std::copy_n(Normal.begin() + Input + 14, 4, BigObj.begin() + Output + 16);
+    std::copy_n(Normal.begin() + static_cast<Difference>(Input + 14), 4,
+                BigObj.begin() + static_cast<Difference>(Output + 16));
     const uint8_t AuxCount = Normal[Input + 17];
     ASSERT_LE(AuxCount, SymbolCount - I - 1);
     for (uint8_t J = 0; J < AuxCount; ++J) {
-      std::copy_n(Normal.begin() + Input + (J + 1) * 18, 18,
-                  BigObj.begin() + Output + (J + 1) * 20);
+      std::copy_n(
+          Normal.begin() + static_cast<Difference>(Input + (J + 1) * 18), 18,
+          BigObj.begin() + static_cast<Difference>(Output + (J + 1) * 20));
     }
     I += 1 + AuxCount;
   }
-  std::copy(Normal.begin() + StringTable, Normal.end(),
-            BigObj.begin() + BigSymbolTable +
-                static_cast<size_t>(SymbolCount) * 20);
+  std::copy(Normal.begin() + static_cast<Difference>(StringTable), Normal.end(),
+            BigObj.begin() +
+                static_cast<Difference>(BigSymbolTable +
+                                        static_cast<size_t>(SymbolCount) * 20));
   auto Parsed =
       llvm::object::ObjectFile::createObjectFile(llvm::MemoryBufferRef(
           llvm::StringRef(reinterpret_cast<const char *>(BigObj.data()),

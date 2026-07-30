@@ -322,8 +322,8 @@ Expect<RelocationResult> applyAArch64(const LinkGraph &Graph) {
                       UINT32_C(0x39000000)};
           break;
         case llvm::ELF::R_AARCH64_LDST64_ABS_LO12_NC:
-          Encoding = {Low12Scale::DoubleWord, UINT32_C(0x3F000000),
-                      UINT32_C(0x39000000)};
+          Encoding = {Low12Scale::DoubleWord, UINT32_C(0xFB000000),
+                      UINT32_C(0xF9000000)};
           break;
         case llvm::ELF::R_AARCH64_LDST128_ABS_LO12_NC:
           Encoding = {Low12Scale::QuadWord, UINT32_C(0x3F800000),

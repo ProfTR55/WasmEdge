@@ -335,21 +335,28 @@ bool hasExistingFDE(const LinkGraph &Graph, SymbolId Function) {
 
 bool hasAssociatedFDE(const LinkGraph &Graph,
                       const CompactUnwindRecord &Record) {
-  if (!Record.FDE || *Record.FDE >= Graph.symbols().size())
+  if (!Record.FDE || *Record.FDE >= Graph.symbols().size() ||
+      Record.Function >= Graph.symbols().size())
     return false;
   const auto &FDE = Graph.symbols()[*Record.FDE];
+  const auto &Function = Graph.symbols()[Record.Function];
+  const auto IsFunction = [&](SymbolId Id) {
+    return Id < Graph.symbols().size() &&
+           Graph.symbols()[Id].Section == Function.Section &&
+           Graph.symbols()[Id].Offset == Function.Offset;
+  };
   return std::any_of(Graph.ehFrameReferences().begin(),
                      Graph.ehFrameReferences().end(),
                      [&](const auto &Reference) {
                        return Reference.Section == FDE.Section &&
                               Reference.Offset == FDE.Offset + 8 &&
-                              Reference.Symbol == Record.Function;
+                              IsFunction(Reference.Symbol);
                      }) ||
          std::any_of(Graph.relocations().begin(), Graph.relocations().end(),
                      [&](const auto &Relocation) {
                        return Relocation.Section == FDE.Section &&
                               Relocation.Offset == FDE.Offset + 8 &&
-                              Relocation.Symbol == Record.Function;
+                              IsFunction(Relocation.Symbol);
                      });
 }
 
